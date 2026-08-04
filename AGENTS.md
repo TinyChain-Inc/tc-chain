@@ -15,6 +15,12 @@ pulling in host-specific details.
 - Prefer feature flags over new crates for optional adapters. Default features should
   preserve the minimal kernel so downstream hosts can embed it without extra surface
   area.
+- Own global consistency and reconciliation policy at the chain boundary.
+  Upstream collection/storage layers should fail closed and surface conflict or
+  ambiguity evidence; `tc-chain` decides canonical reconciliation outcomes.
+- Own authoritative transaction history policy (WAL semantics, canonical replay
+  ordering, and conflict reconciliation). Other crates may cache/materialize
+  local state, but they must not define an independent WAL authority.
 
 ## Testing and documentation
 
