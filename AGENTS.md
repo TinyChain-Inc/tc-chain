@@ -21,6 +21,10 @@ pulling in host-specific details.
 - Own authoritative transaction history policy (WAL semantics, canonical replay
   ordering, and conflict reconciliation). Other crates may cache/materialize
   local state, but they must not define an independent WAL authority.
+- Apply the repository backpressure policy to ledger ingest and replication.
+  Billable/authoritative events are lossless and fail closed at bounded capacity;
+  drops are allowed only for an explicitly best-effort channel with observable
+  pressure/drop counters and deterministic retry guidance.
 
 ## Testing and documentation
 
