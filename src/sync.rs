@@ -1,28 +1,19 @@
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 
 use freqfs::DirLock;
-use pathlink::{PathBuf, PathSegment};
+use pathlink::PathBuf;
+use tc_collection::{Collection, StorageContext};
+use tc_error::{TCError, TCResult};
+use tc_ir::{IntoView, Public, Scalar, Transact, TxnId};
+use tc_state::State;
 
 use crate::TxnTaskQueue;
 use crate::storage::{self, ChainFile, MutationRecord, Store};
-use tc_collection::{Collection, StorageContext};
-use tc_error::{TCError, TCResult};
-use tc_ir::{Handler, IntoView, Public, Route, Scalar, Transact, TxnId};
-use tc_state::State;
 
 pub(crate) struct Inner<Txn: StorageContext> {
-    subject: Collection<Txn>,
+    pub(crate) subject: Collection<Txn>,
     store: Store<Txn>,
     queue: TxnTaskQueue<MutationRecord>,
-
-    #[cfg(test)]
-    pub(crate) fault: std::sync::atomic::AtomicU8,
-    #[cfg(test)]
-    pub(crate) pause: std::sync::atomic::AtomicU8,
-    #[cfg(test)]
-    pub(crate) reached: tokio::sync::Notify,
 }
 
 /// A v1-style request WAL around a native persistent collection.
@@ -50,29 +41,8 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
                 subject,
                 store,
                 queue,
-                #[cfg(test)]
-                fault: std::sync::atomic::AtomicU8::new(0),
-                #[cfg(test)]
-                pause: std::sync::atomic::AtomicU8::new(0),
-                #[cfg(test)]
-                reached: tokio::sync::Notify::new(),
             }),
         }
-    }
-
-    #[cfg(test)]
-    async fn step(&self, stage: u8) -> TCResult<()> {
-        if self.inner.pause.load(Ordering::Acquire) == stage {
-            self.inner.reached.notify_one();
-            std::future::pending::<()>().await;
-        }
-
-        if self.inner.fault.load(Ordering::Acquire) == stage {
-            return Err(TCError::from(std::io::Error::other(
-                "injected persistence failure",
-            )));
-        }
-        Ok(())
     }
 
     /// Publish an empty WAL around an unpublished canonical subject.
@@ -190,11 +160,11 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
         self.inner.queue.register(txn.id()).map_err(Into::into)
     }
 
-    fn readable(&self, txn: &Txn) -> TCResult<()> {
+    pub(crate) fn readable(&self, txn: &Txn) -> TCResult<()> {
         self.inner.queue.readable(txn.id()).map_err(Into::into)
     }
 
-    async fn mutate<F, Fut>(
+    pub(crate) async fn mutate<F, Fut>(
         &self,
         txn: &Txn,
         path: PathBuf,
@@ -208,8 +178,6 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
     {
         let mut task = self.inner.queue.start(txn.id())?;
 
-        #[cfg(test)]
-        self.step(1).await?;
         let record = match value {
             Some(value) => {
                 MutationRecord::Put(path, key, self.inner.store.capture(txn, value).await?)
@@ -217,11 +185,7 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
             None => MutationRecord::Delete(path, key),
         };
 
-        #[cfg(test)]
-        self.step(2).await?;
         task.record(record)?;
-        #[cfg(test)]
-        self.step(13).await?;
         selected().await?;
         task.complete().map_err(Into::into)
     }
@@ -245,25 +209,15 @@ impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
         };
         if !records.is_empty() {
             let mut committed = self.inner.store.committed.read().await?.clone();
-            #[cfg(test)]
-            self.step(3).await?;
             self.inner.store.sync(&records).await?;
-            #[cfg(test)]
-            self.step(12).await?;
             if committed.block.mutations.insert(id, records).is_some() {
                 return Err(TCError::conflict("transaction already published"));
             }
-            #[cfg(test)]
-            self.step(8).await?;
 
             storage::publish(&self.inner.store.committed, committed).await?;
-            #[cfg(test)]
-            self.step(4).await?;
         }
 
         self.inner.subject.commit(id).await?;
-        #[cfg(test)]
-        self.step(5).await?;
 
         operation.complete();
         Ok(())
@@ -294,107 +248,15 @@ impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
         }
 
         operation.arm();
-        #[cfg(test)]
-        self.step(6).await?;
         self.inner.subject.finalize(cutoff).await?;
-        #[cfg(test)]
-        self.step(7).await?;
         self.inner.subject.sync_all().await?;
-        #[cfg(test)]
-        self.step(9).await?;
 
         committed.frontier = Some(*cutoff);
         committed.block.mutations.retain(|id, _| id > cutoff);
         storage::publish(&self.inner.store.committed, committed).await?;
-        #[cfg(test)]
-        self.step(10).await?;
 
         operation.finalize(*cutoff)?;
-        #[cfg(test)]
-        self.step(11).await?;
         operation.complete();
         Ok(())
-    }
-}
-
-struct ChainHandler<'a, Txn: StorageContext> {
-    chain: &'a SyncChain<Txn>,
-    path: PathBuf,
-    leaf: Box<dyn Handler<'a, State<Txn>> + 'a>,
-}
-
-impl<Txn: StorageContext + 'static> Route<State<Txn>> for SyncChain<Txn> {
-    fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn Handler<'a, State<Txn>> + 'a>> {
-        Some(Box::new(ChainHandler {
-            chain: self,
-            path: PathBuf::from_slice(path),
-            leaf: self.inner.subject.route(path)?,
-        }))
-    }
-}
-
-impl<'a, Txn: StorageContext + 'static> Handler<'a, State<Txn>> for ChainHandler<'a, Txn> {
-    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State<Txn>>>
-    where
-        'txn: 'a,
-    {
-        let Self { chain, leaf, .. } = *self;
-        let get = leaf.get()?;
-
-        Some(Box::new(move |txn, key| {
-            Box::pin(async move {
-                chain.readable(txn)?;
-                get(txn, key).await
-            })
-        }))
-    }
-
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, State<Txn>>>
-    where
-        'txn: 'a,
-    {
-        let Self { chain, leaf, .. } = *self;
-        let post = leaf.post()?;
-
-        Some(Box::new(move |txn, params| {
-            Box::pin(async move {
-                chain.readable(txn)?;
-                post(txn, params).await
-            })
-        }))
-    }
-
-    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, State<Txn>>>
-    where
-        'txn: 'a,
-    {
-        let Self { chain, path, leaf } = *self;
-        let put = leaf.put()?;
-
-        Some(Box::new(move |txn, key, value| {
-            Box::pin(async move {
-                chain
-                    .mutate(txn, path, key.clone(), Some(value.clone()), || {
-                        put(txn, key, value)
-                    })
-                    .await
-            })
-        }))
-    }
-
-    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, State<Txn>>>
-    where
-        'txn: 'a,
-    {
-        let Self { chain, path, leaf } = *self;
-        let delete = leaf.delete()?;
-
-        Some(Box::new(move |txn, key| {
-            Box::pin(async move {
-                chain
-                    .mutate(txn, path, key.clone(), None, || delete(txn, key))
-                    .await
-            })
-        }))
     }
 }

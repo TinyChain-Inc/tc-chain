@@ -1,6 +1,7 @@
 //! A PUT/DELETE recovery log for transactional collection subjects.
 #![forbid(unsafe_code)]
 
+mod public;
 mod storage;
 mod sync;
 

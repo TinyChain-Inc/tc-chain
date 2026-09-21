@@ -17,3 +17,8 @@ New behavior must remain transport-neutral and include focused ordering, replay,
 corruption, backpressure, and restart tests appropriate to the implemented
 capability. Update the Chain contract only for a stable ownership or semantic
 change; keep proposals in the roadmap.
+
+Cancellation tests use delegated storage and workspace locks to exercise selected
+boundaries without instrumentation in SyncChain. Restart and recovery-state fixtures
+cover retained WAL behavior and fail-closed conflicts; they do not constitute
+exhaustive persistence-stage fault injection or power-loss validation.

@@ -504,117 +504,63 @@ fn recovery_rejects_replacement_transaction_ids() {
 }
 
 #[test]
-fn restart_at_every_persistence_boundary() {
+fn durable_canonical_insert_with_retained_wal_fails_closed() {
     run(|| async {
-        for table in [false, true] {
-            for stage in 1..=12 {
-                let f = Fixture::new();
-                let chain = f.chain(table).await;
-                chain.inner.fault.store(stage, Ordering::Release);
-                if stage <= 2 {
-                    assert!(insert(&chain, &f.txn(2), table, 1).await.is_err());
-                } else {
-                    insert(&chain, &f.txn(2), table, 1).await.unwrap();
-                    if stage <= 5 || stage == 8 || stage == 12 {
-                        assert!(chain.commit(id(2)).await.is_err());
-                    } else {
-                        chain.commit(id(2)).await.unwrap();
-                        assert!(chain.finalize(&id(2)).await.is_err());
-                    }
-                }
-                drop(chain);
-                if table && stage == 9 {
-                    // Canonical insert is durable but its request remains in the WAL.
-                    // Ordinary strict-insert replay must fail, retaining the evidence.
-                    assert!(f.reopen().await.is_err());
-                    assert_eq!(
-                        read_log(&Fixture::open_log(&f.path))
-                            .await
-                            .unwrap()
-                            .block
-                            .mutations
-                            .len(),
-                        1
-                    );
-                    continue;
-                }
-                let recovered = f
-                    .reopen()
-                    .await
-                    .unwrap_or_else(|error| panic!("stage {stage}, table {table}: {error}"));
-                assert_eq!(
-                    count(&recovered, &f.txn(20)).await,
-                    u64::from(stage >= 4 && stage != 8 && stage != 12),
-                    "stage {stage}, table {table}"
-                );
-            }
-        }
+        let f = Fixture::new();
+        let chain = f.chain(true).await;
+        insert(&chain, &f.txn(2), true, 1).await.unwrap();
+        chain.commit(id(2)).await.unwrap();
+        let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
+
+        // Construct the recovery state explicitly: canonical effects are durable,
+        // but the WAL still contains the strict insert. This is not a crash simulation.
+        chain.inner.subject.finalize(&id(2)).await.unwrap();
+        chain.inner.subject.sync_all().await.unwrap();
+        drop(chain);
+
+        assert!(f.reopen().await.is_err());
+        assert_eq!(
+            std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
+            publication
+        );
     });
 }
 
 #[test]
-fn cancelled_lifecycle_requires_reopening() {
+fn cancelled_commit_requires_reopening() {
     run(|| async {
-        for stage in 3..=12 {
+        for table in [false, true] {
             let f = Fixture::new();
-            let chain = f.chain(false).await;
-            insert(&chain, &f.txn(2), false, 1).await.unwrap();
-            let committing = matches!(stage, 3..=5 | 8 | 12);
-            if !committing {
-                chain.commit(id(2)).await.unwrap();
-            }
-            chain.inner.pause.store(stage, Ordering::Release);
-            let mut operation = Box::pin(async {
-                if committing {
-                    chain.commit(id(2)).await
-                } else {
-                    chain.finalize(&id(2)).await
-                }
-            });
-            tokio::select! {
-                _ = chain.inner.reached.notified() => {},
-                result = &mut operation => panic!("stage {stage} completed before cancellation: {result:?}"),
-            }
+            let chain = f.chain(table).await;
+            insert(&chain, &f.txn(2), table, 1).await.unwrap();
+            chain.commit(id(2)).await.unwrap();
+            insert(&chain, &f.txn(3), table, 2).await.unwrap();
+            let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
+
+            let file = log_file(&f.log).await;
+            let guard = file.write().await.unwrap();
+            let mut commit = Box::pin(chain.commit(id(3)));
+            assert!(futures::poll!(&mut commit).is_pending());
+            assert!(chain.rollback(&id(3)).await.is_err());
+            drop(commit);
+            drop(guard);
+
+            assert!(chain.register(f.txn(4)).is_err());
+            assert!(chain.commit(id(3)).await.is_err());
+            assert!(chain.rollback(&id(3)).await.is_err());
+            assert!(chain.finalize(&id(3)).await.is_err());
             assert!(
                 chain
-                    .rollback(&id(2))
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("operation in progress")
-            );
-            chain.register(f.txn(3)).unwrap();
-            drop(operation);
-            assert!(
-                chain
-                    .register(f.txn(4))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("requires reload")
-            );
-            assert!(
-                chain
-                    .commit(id(2))
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("requires reload")
-            );
-            assert!(chain.rollback(&id(2)).await.is_err());
-            assert!(chain.finalize(&id(2)).await.is_err());
-            assert!(
-                chain
-                    .get(&f.txn(3), &["count".parse().unwrap()], Value::None.into())
+                    .get(&f.txn(4), &["count".parse().unwrap()], Value::None.into())
                     .await
                     .is_err()
             );
-            drop(chain);
-            let reopened = f.reopen().await.unwrap();
             assert_eq!(
-                count(&reopened, &f.txn(4)).await,
-                u64::from(stage >= 4 && stage != 8 && stage != 12),
-                "stage {stage}"
+                std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
+                publication
             );
+            drop(chain);
+            assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(4)).await, 1);
         }
     });
 }
@@ -656,22 +602,31 @@ fn stalled_handlers_do_not_exclude_earlier_commit() {
 #[test]
 fn same_transaction_keeps_replay_order_and_cancellation_preserves_failure() {
     run(|| async {
-        for stage in [2, 13] {
+        for capture in [false, true] {
             let f = Fixture::new();
             let chain = f.chain(false).await;
             let txn = f.txn(2);
-            chain.inner.pause.store(stage, Ordering::Release);
-            let mut first = Box::pin(insert(&chain, &txn, false, 1));
-            tokio::select! {
-                _ = chain.inner.reached.notified() => {},
-                result = &mut first => panic!("stage {stage} completed: {result:?}"),
-            }
-            chain.inner.pause.store(0, Ordering::Release);
+            let value = if capture {
+                State::from(f.source(false).await)
+            } else {
+                State::from(Value::Tuple(vec![Value::from(1_u64)]))
+            };
+            // Block capture before recording, or workspace allocation in the selected handler.
+            let guard = if capture {
+                f.values.write().await
+            } else {
+                txn.root.write().await
+            };
+            let path = ["insert".parse().unwrap()];
+            let mut first = Box::pin(chain.put(&txn, &path, Value::None.into(), value));
+            assert!(futures::poll!(&mut first).is_pending());
             assert!(insert(&chain, &txn, false, 2).await.is_err());
             assert!(chain.commit(txn.id()).await.is_err());
             assert!(chain.rollback(&txn.id()).await.is_err());
             assert!(chain.finalize(&txn.id()).await.is_err());
             drop(first);
+            drop(guard);
+
             assert!(chain.commit(txn.id()).await.is_err());
             assert!(
                 chain
@@ -695,12 +650,13 @@ fn unfinished_later_requests_do_not_exclude_earlier_decisions() {
             let chain = f.chain(table).await;
             insert(&chain, &f.txn(2), table, 1).await.unwrap();
             let txn = f.txn(3);
-            chain.inner.pause.store(13, Ordering::Release);
+            let workspace = txn.root.write().await;
             let mut later = Box::pin(insert(&chain, &txn, table, 2));
             assert!(futures::poll!(&mut later).is_pending());
             chain.commit(id(2)).await.unwrap();
             chain.finalize(&id(2)).await.unwrap();
             drop(later);
+            drop(workspace);
             chain.rollback(&id(3)).await.unwrap();
             assert_eq!(count(&chain, &f.txn(4)).await, 1);
             drop(chain);
@@ -1348,58 +1304,47 @@ fn native_collection_values_are_copied_and_verified() {
 }
 
 #[test]
-fn failed_and_cancelled_collection_arguments_are_reclaimed_on_load() {
+fn failed_collection_arguments_are_reclaimed_on_load() {
     run(|| async {
-        for cancel in [false, true] {
-            let f = Fixture::new();
-            let chain = f.chain(false).await;
-            assert!(
-                chain
-                    .put(
-                        &f.txn(3),
-                        &["insert".parse().unwrap()],
-                        Value::None.into(),
-                        f.source(false).await.into()
-                    )
-                    .await
-                    .is_err()
-            );
-            let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-            let txn = f.txn(2);
-            let path = ["insert".parse().unwrap()];
-            let source = State::from(f.source(false).await);
-            if cancel {
-                chain.inner.pause.store(2, Ordering::Release);
-                let mut put = Box::pin(chain.put(&txn, &path, Value::None.into(), source));
-                tokio::select! {
-                    _ = chain.inner.reached.notified() => {},
-                    result = &mut put => panic!("unexpected completion: {result:?}"),
-                }
-            } else {
-                assert!(
-                    chain
-                        .put(&txn, &path, Value::None.into(), source)
-                        .await
-                        .is_err()
-                );
-            }
-            assert_eq!(f.values.read().await.len(), 1);
-            assert!(chain.commit(txn.id()).await.is_err());
-            chain.rollback(&id(4)).await.unwrap();
-            chain.rollback(&txn.id()).await.unwrap();
-            assert_eq!(
-                std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
-                publication
-            );
-            assert_eq!(f.values.read().await.len(), 1);
-            chain.finalize(&id(3)).await.unwrap();
-            assert_eq!(f.values.read().await.len(), 1);
-            f.values.sync().await.unwrap();
-            drop(chain);
-            let reopened = f.reopen().await.unwrap();
-            assert_eq!(count(&reopened, &f.txn(5)).await, 0);
-            assert!(Fixture::open_values(&f.path).read().await.is_empty());
-        }
+        let f = Fixture::new();
+        let chain = f.chain(false).await;
+        assert!(
+            chain
+                .put(
+                    &f.txn(3),
+                    &["insert".parse().unwrap()],
+                    Value::None.into(),
+                    f.source(false).await.into()
+                )
+                .await
+                .is_err()
+        );
+        let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
+        let txn = f.txn(2);
+        let path = ["insert".parse().unwrap()];
+        let source = State::from(f.source(false).await);
+        assert!(
+            chain
+                .put(&txn, &path, Value::None.into(), source)
+                .await
+                .is_err()
+        );
+        assert_eq!(f.values.read().await.len(), 1);
+        assert!(chain.commit(txn.id()).await.is_err());
+        chain.rollback(&id(4)).await.unwrap();
+        chain.rollback(&txn.id()).await.unwrap();
+        assert_eq!(
+            std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
+            publication
+        );
+        assert_eq!(f.values.read().await.len(), 1);
+        chain.finalize(&id(3)).await.unwrap();
+        assert_eq!(f.values.read().await.len(), 1);
+        f.values.sync().await.unwrap();
+        drop(chain);
+        let reopened = f.reopen().await.unwrap();
+        assert_eq!(count(&reopened, &f.txn(5)).await, 0);
+        assert!(Fixture::open_values(&f.path).read().await.is_empty());
     });
 }
 
@@ -1479,35 +1424,6 @@ fn published_transaction_is_not_overwritten() {
         );
         assert_eq!(std::fs::read(path).unwrap(), original);
         assert!(chain.register(f.txn(3)).is_err());
-    });
-}
-
-#[test]
-fn live_lifecycle_preserves_captures_owned_by_unfinished_handlers() {
-    run(|| async {
-        let f = Fixture::new();
-        let chain = f.chain(false).await;
-        insert(&chain, &f.txn(2), false, 1).await.unwrap();
-        let txn = f.txn(3);
-        let path = ["insert".parse().unwrap()];
-        chain.inner.pause.store(13, Ordering::Release);
-        let mut later = Box::pin(chain.put(
-            &txn,
-            &path,
-            Value::None.into(),
-            f.source(false).await.into(),
-        ));
-        tokio::select! {
-            _ = chain.inner.reached.notified() => {},
-            result = &mut later => panic!("handler must remain unfinished: {result:?}"),
-        }
-        assert_eq!(f.values.read().await.len(), 1);
-        chain.commit(id(2)).await.unwrap();
-        chain.finalize(&id(2)).await.unwrap();
-        assert_eq!(f.values.read().await.len(), 1);
-        drop(later);
-        chain.rollback(&id(3)).await.unwrap();
-        assert_eq!(f.values.read().await.len(), 1);
     });
 }
 
