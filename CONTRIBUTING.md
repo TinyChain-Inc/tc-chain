@@ -1,7 +1,9 @@
 # Contributing to tc-chain
 
-Follow the workspace [contributor guide](../CONTRIBUTING.md), this crate's
-[invariants](AGENTS.md), and the canonical [Chain contract](CHAIN_CONTRACT.md).
+Read this repository's [invariants](AGENTS.md) and canonical
+[Chain contract](CHAIN_CONTRACT.md). The parent workspace
+[contributor guide](https://github.com/TinyChain-Inc/tcv2/blob/main/CONTRIBUTING.md)
+is non-normative integration context for a superproject checkout.
 
 Before opening a pull request, run:
 
