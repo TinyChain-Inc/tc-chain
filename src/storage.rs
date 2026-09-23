@@ -52,6 +52,7 @@ async fn identity<Txn: StorageContext>(collection: &Collection<Txn>, id: TxnId) 
 /// A persisted request, never a second invocation interface.
 #[derive(Clone)]
 pub enum MutationRecord {
+    Restore(Scalar),
     Put(PathBuf, Scalar, Scalar),
     Delete(PathBuf, Scalar),
 }
@@ -59,7 +60,7 @@ pub enum MutationRecord {
 impl MutationRecord {
     pub fn value(&self) -> Option<&Scalar> {
         match self {
-            Self::Put(_, _, value) => Some(value),
+            Self::Put(_, _, value) | Self::Restore(value) => Some(value),
             Self::Delete(..) => None,
         }
     }
@@ -68,6 +69,7 @@ impl MutationRecord {
 impl<'en> en::IntoStream<'en> for MutationRecord {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
+            Self::Restore(value) => (value,).into_stream(encoder),
             Self::Put(path, key, value) => (path, key, value).into_stream(encoder),
             Self::Delete(path, key) => (path, key).into_stream(encoder),
         }
@@ -77,6 +79,7 @@ impl<'en> en::IntoStream<'en> for MutationRecord {
 impl<'en> en::ToStream<'en> for MutationRecord {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
+            Self::Restore(value) => (value,).into_stream(encoder),
             Self::Put(path, key, value) => (path, key, value).into_stream(encoder),
             Self::Delete(path, key) => (path, key).into_stream(encoder),
         }
@@ -93,21 +96,31 @@ impl de::FromStream for MutationRecord {
             type Value = MutationRecord;
 
             fn expecting() -> &'static str {
-                "a DELETE (path, key) or PUT (path, key, value)"
+                "a restoration (collection,), DELETE (path, key), or PUT (path, key, value)"
             }
 
             async fn visit_seq<A: de::SeqAccess>(
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let path = seq
+                let first: Scalar = seq
                     .next_element(())
                     .await?
                     .ok_or_else(|| de::Error::invalid_length(0, Self::expecting()))?;
-                let key = seq
-                    .next_element(())
-                    .await?
-                    .ok_or_else(|| de::Error::invalid_length(1, Self::expecting()))?;
+                let Some(key) = seq.next_element(()).await? else {
+                    if reference(&first).map_err(de::Error::custom)?.is_none() {
+                        return Err(de::Error::custom(
+                            "restoration requires a stored collection reference",
+                        ));
+                    }
+                    return Ok(MutationRecord::Restore(first));
+                };
+                let path = match first {
+                    Scalar::Value(Value::String(path)) => {
+                        path.as_str().parse().map_err(de::Error::custom)?
+                    }
+                    _ => return Err(de::Error::custom("invalid mutation path")),
+                };
 
                 let record = match seq.next_element(()).await? {
                     Some(value) => MutationRecord::Put(path, key, value),
@@ -259,7 +272,7 @@ impl<Txn: StorageContext + 'static> Store<Txn> {
             .get_dir(name.as_str())
             .cloned()
             .ok_or_else(|| TCError::bad_request("missing stored collection"))?;
-        let collection = Collection::<Txn>::load(dir, schema)?;
+        let collection = Collection::<Txn>::load(dir, schema).await?;
 
         if identity(&collection, id).await? != *name {
             return Err(TCError::bad_request("stored collection checksum mismatch"));
@@ -288,26 +301,50 @@ impl<Txn: StorageContext + 'static> Store<Txn> {
             let committed = self.committed.read().await?;
             references(committed.block.mutations.values().flatten())?
         };
-        collect(&self.values, &retained).await
+        let names = self
+            .values
+            .read()
+            .await
+            .names()
+            .filter(|name| !retained.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for name in &names {
+            self.values.write().await.delete(name).await;
+        }
+
+        if !names.is_empty() {
+            self.values.sync_deleted().await?;
+        }
+        Ok(())
     }
 }
 
-/// SyncChain publication metadata around a shared semantic block.
+/// Filesystem encoding and checksum boundary for the committed semantic block.
 #[derive(Clone)]
 pub struct ChainFile {
-    pub(crate) frontier: Option<TxnId>,
+    pub(crate) finalized: Option<TxnId>,
+    pub(crate) materializing: Option<TxnId>,
     pub(crate) block: ChainBlock,
 }
 
 impl Default for ChainFile {
     fn default() -> Self {
         Self {
-            frontier: None,
+            finalized: None,
+            materializing: None,
             block: ChainBlock {
                 previous_hash: Sha256Hash::default(),
                 mutations: BTreeMap::new(),
             },
         }
+    }
+}
+
+impl<'en> en::ToStream<'en> for ChainFile {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        (self.finalized, self.materializing, &self.block).into_stream(encoder)
     }
 }
 
@@ -334,10 +371,14 @@ impl FileLoad for ChainFile {
         let value = {
             let stream = ReaderStream::new(file).inspect_ok(|bytes| hash.update(bytes));
             futures::pin_mut!(stream);
-            let (frontier, block) = destream_json::try_decode((), &mut stream)
+            let (finalized, materializing, block) = destream_json::try_decode((), &mut stream)
                 .await
                 .map_err(invalid)?;
-            let value = Self { frontier, block };
+            let value = Self {
+                finalized,
+                materializing,
+                block,
+            };
             while stream.try_next().await?.is_some() {}
             value
         };
@@ -377,7 +418,7 @@ impl FileSave for ChainFile {
 
 impl ChainFile {
     fn encoded(&self) -> io::Result<futures::stream::BoxStream<'_, io::Result<bytes::Bytes>>> {
-        Ok(destream_json::encode((self.frontier, &self.block))
+        Ok(destream_json::encode(self)
             .map_err(invalid)?
             .map_err(invalid)
             .boxed())
@@ -430,26 +471,4 @@ fn references<'a>(
         .filter_map(|value| reference(value).transpose())
         .map(|reference| reference.map(|(name, _, _)| name.to_string()))
         .collect()
-}
-
-async fn collect<F: FileLoad + FileSave + Clone>(
-    root: &DirLock<F>,
-    retained: &std::collections::BTreeSet<String>,
-) -> TCResult<()> {
-    let names = root
-        .read()
-        .await
-        .names()
-        .filter(|name| !retained.contains(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    for name in &names {
-        root.write().await.delete(name).await;
-    }
-
-    if !names.is_empty() {
-        root.sync_deleted().await?;
-    }
-    Ok(())
 }

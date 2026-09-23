@@ -8,13 +8,12 @@ This roadmap contains unimplemented work. All variants must satisfy the common
 - Integrate the implemented WAL with executable Services and host readiness.
 - Integrate caller-owned admission for retained transaction memory before claiming
   end-to-end bounded resource use; storage cache admission alone does not cover it.
-- Implement caller-coordinated native snapshot replacement with explicit durable
-  recovery semantics, without adding a public collection restoration route.
 - Demonstrate coordinated snapshot synchronization through the Service/Cluster
-  path while preserving the original transaction capability.
-- Demonstrate recovery across arbitrary partial multi-file finalization before
-  closing the stronger Issue #2 acceptance requirement. Strict-insert replay
-  conflicts currently fail closed and retain the WAL.
+  path while preserving the original transaction capability. Select authoritative
+  replacement using authenticated membership and history/checkpoint evidence;
+  resources with unfinished materialization remain unavailable until this exists.
+- Extend restart and syscall-failure evidence with deployment-filesystem
+  power-loss validation of WAL publication and canonical materialization ordering.
 - Evaluate bounded group commit against measured workloads without adding a
   second persistence model or weakening durability.
 

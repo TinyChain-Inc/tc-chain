@@ -4,7 +4,7 @@ use freqfs::DirLock;
 use pathlink::PathBuf;
 use tc_collection::{Collection, StorageContext};
 use tc_error::{TCError, TCResult};
-use tc_ir::{IntoView, Public, Scalar, Transact, TxnId};
+use tc_ir::{IntoView, Public, Scalar, Sha256Hash, Transact, TxnId};
 use tc_state::State;
 
 use crate::TxnTaskQueue;
@@ -70,46 +70,65 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
         Ok(Self::new(subject, Store { committed, values }, queue))
     }
 
-    /// Replay into a strictly loaded canonical subject using original identities.
-    /// Conflicts and inconsistent storage fail closed, retaining the WAL.
-    pub async fn load<F, Fut>(
-        subject: Collection<Txn>,
+    /// Check the WAL before invoking the caller's strict native subject loader.
+    /// Replay retained requests using original identities and fresh workspaces.
+    /// Unfinished materialization requires authoritative resynchronization;
+    /// no native loader, replay capability, or cleanup is invoked in that case.
+    pub async fn load<L, Loaded, F, Fut>(
+        subject: L,
         root: DirLock<ChainFile>,
         values: DirLock<Txn::File>,
         queue: TxnTaskQueue<MutationRecord>,
         mut transaction: F,
     ) -> TCResult<Self>
     where
+        L: FnOnce() -> Loaded,
+        Loaded: std::future::Future<Output = TCResult<Collection<Txn>>>,
         F: FnMut(TxnId) -> Fut,
         Fut: std::future::Future<Output = TCResult<Txn>>,
     {
+        queue.validate_fresh()?;
+        let file = storage::load(&root).await?;
+        let committed = file.read().await?.clone();
+        if committed.materializing.is_some() {
+            return Err(TCError::bad_request(
+                "recovery required: unfinished canonical materialization; authoritative resynchronization is required",
+            ));
+        }
+        if committed.block.previous_hash != tc_ir::Sha256Hash::default() {
+            return Err(TCError::bad_request("invalid SyncChain predecessor"));
+        }
+        if committed.block.mutations.iter().any(|(id, records)| {
+            committed.finalized.is_some_and(|frontier| *id <= frontier) || records.is_empty()
+        }) {
+            return Err(TCError::bad_request("conflicting or empty WAL transaction"));
+        }
+        let subject = subject().await?;
         if !subject.is_persistent() {
             return Err(TCError::bad_request(
                 "SyncChain requires a persistent collection owner",
             ));
         }
-
-        queue.validate_fresh()?;
-        let committed = storage::load(&root).await?;
-        let chain = Self::new(subject, Store { committed, values }, queue);
+        let chain = Self::new(
+            subject,
+            Store {
+                committed: file,
+                values,
+            },
+            queue,
+        );
         let mut operation = chain.inner.queue.operation()?;
-        let committed = chain.inner.store.committed.read().await?.clone();
-        if committed.block.previous_hash != tc_ir::Sha256Hash::default() {
-            return Err(TCError::bad_request("invalid SyncChain predecessor"));
-        }
 
         // Validate every record and stored collection before invoking any mutation handler.
         for (id, records) in &committed.block.mutations {
-            if committed.frontier.is_some_and(|frontier| *id <= frontier) || records.is_empty() {
-                return Err(TCError::bad_request("conflicting or empty WAL transaction"));
-            }
             for value in records.iter().filter_map(MutationRecord::value) {
                 chain.inner.store.resolve(*id, value.clone()).await?;
             }
         }
 
         operation.arm();
-        if let Some(frontier) = committed.frontier {
+        if let Some(frontier) = committed.finalized {
+            chain.inner.subject.finalize(&frontier).await?;
             operation.finalize(frontier)?;
         }
 
@@ -123,6 +142,14 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
 
             for record in records {
                 match record {
+                    MutationRecord::Restore(value) => {
+                        let State::Collection(snapshot) =
+                            chain.inner.store.resolve(id, value).await?
+                        else {
+                            return Err(TCError::bad_request("invalid restoration snapshot"));
+                        };
+                        chain.inner.subject.restore_from(&txn, &snapshot).await?;
+                    }
                     MutationRecord::Put(path, key, value) => {
                         chain
                             .inner
@@ -151,13 +178,41 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
         }
 
         chain.inner.store.reclaim().await?;
+        root.sync_deleted().await?;
         operation.complete();
         Ok(chain)
+    }
+
+    /// Record and stage a native replacement using a caller-supplied snapshot.
+    pub async fn restore_from(&self, txn: &Txn, snapshot: &Collection<Txn>) -> TCResult<()> {
+        let mut task = self.inner.queue.start(txn.id())?;
+        let reference = self
+            .inner
+            .store
+            .capture(txn, State::from(snapshot.clone()))
+            .await?;
+        let State::Collection(captured) = self
+            .inner
+            .store
+            .resolve(txn.id(), reference.clone())
+            .await?
+        else {
+            return Err(TCError::bad_request("invalid restoration snapshot"));
+        };
+        task.record(MutationRecord::Restore(reference))?;
+        self.inner.subject.restore_from(txn, &captured).await?;
+        task.complete().map_err(Into::into)
     }
 
     /// Admit a caller-owned transaction without allocating an identity.
     pub fn register(&self, txn: Txn) -> TCResult<()> {
         self.inner.queue.register(txn.id()).map_err(Into::into)
+    }
+
+    /// Hash the transaction-visible subject, including its class, schema, and contents.
+    pub async fn hash(&self, txn: &Txn) -> TCResult<Sha256Hash> {
+        self.readable(txn)?;
+        self.inner.subject.hash(txn.id()).await
     }
 
     pub(crate) fn readable(&self, txn: &Txn) -> TCResult<()> {
@@ -218,7 +273,6 @@ impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
         }
 
         self.inner.subject.commit(id).await?;
-
         operation.complete();
         Ok(())
     }
@@ -239,19 +293,26 @@ impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
     async fn finalize(&self, cutoff: &TxnId) -> TCResult<()> {
         let mut operation = self.inner.queue.operation()?;
         operation.check_finalize(cutoff)?;
-        let mut committed = self.inner.store.committed.read().await?.clone();
-        if committed
-            .frontier
-            .is_some_and(|frontier| *cutoff <= frontier)
-        {
-            return Ok(());
-        }
+        let mut committed = {
+            let committed = self.inner.store.committed.read().await?;
+            if committed.finalized.is_some_and(|prior| *cutoff <= prior) {
+                return Ok(());
+            }
+            committed.clone()
+        };
 
+        let materialize = committed.block.mutations.range(..=*cutoff).next().is_some();
         operation.arm();
+        if materialize {
+            committed.materializing = Some(*cutoff);
+            storage::publish(&self.inner.store.committed, committed.clone()).await?;
+        }
         self.inner.subject.finalize(cutoff).await?;
-        self.inner.subject.sync_all().await?;
-
-        committed.frontier = Some(*cutoff);
+        if materialize {
+            self.inner.subject.sync_all().await?;
+        }
+        committed.finalized = Some(*cutoff);
+        committed.materializing = None;
         committed.block.mutations.retain(|id, _| id > cutoff);
         storage::publish(&self.inner.store.committed, committed).await?;
 
