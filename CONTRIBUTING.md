@@ -1,7 +1,9 @@
 # Contributing to tc-chain
 
-Follow the workspace [contributor guide](../CONTRIBUTING.md), this crate's
-[invariants](AGENTS.md), and the canonical [Chain contract](CHAIN_CONTRACT.md).
+Read this repository's [invariants](AGENTS.md) and canonical
+[Chain contract](CHAIN_CONTRACT.md). The parent workspace
+[contributor guide](https://github.com/TinyChain-Inc/tcv2/blob/main/CONTRIBUTING.md)
+is non-normative integration context for a superproject checkout.
 
 Before opening a pull request, run:
 
@@ -15,3 +17,8 @@ New behavior must remain transport-neutral and include focused ordering, replay,
 corruption, backpressure, and restart tests appropriate to the implemented
 capability. Update the Chain contract only for a stable ownership or semantic
 change; keep proposals in the roadmap.
+
+Cancellation tests use delegated storage and workspace locks to exercise selected
+boundaries without instrumentation in SyncChain. Restart and recovery-state fixtures
+cover retained WAL behavior and fail-closed conflicts; they do not constitute
+exhaustive persistence-stage fault injection or power-loss validation.

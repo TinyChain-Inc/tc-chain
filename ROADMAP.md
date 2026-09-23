@@ -3,14 +3,19 @@
 This roadmap contains unimplemented work. All variants must satisfy the common
 [`Chain contract`](CHAIN_CONTRACT.md).
 
-## SyncChain
+## SyncChain integration
 
-- Port the minimal v1 ordered append, visibility, replay, and finalization
-  behavior through ordinary State and collection contracts.
-- Make validated history authoritative and materialized collection state
-  rebuildable.
-- Add deterministic duplicate, gap, conflict, restart, corruption, and
-  resynchronization tests before integration with executable Services.
+- Integrate the implemented WAL with executable Services and host readiness.
+- Integrate caller-owned admission for retained transaction memory before claiming
+  end-to-end bounded resource use; storage cache admission alone does not cover it.
+- Demonstrate coordinated snapshot synchronization through the Service/Cluster
+  path while preserving the original transaction capability. Select authoritative
+  replacement using authenticated membership and history/checkpoint evidence;
+  resources with unfinished materialization remain unavailable until this exists.
+- Extend restart and syscall-failure evidence with deployment-filesystem
+  power-loss validation of WAL publication and canonical materialization ordering.
+- Evaluate bounded group commit against measured workloads without adding a
+  second persistence model or weakening durability.
 
 ## BlockChain
 
