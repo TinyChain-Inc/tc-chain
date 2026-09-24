@@ -1,18 +1,23 @@
 use pathlink::{PathBuf, PathSegment};
-use tc_collection::StorageContext;
+use safecast::TryCastInto;
+use tc_collection::{Collection, CollectionState, StorageContext};
 use tc_ir::{Handler, Route};
-use tc_state::State;
 
 use crate::SyncChain;
 
-struct ChainHandler<'a, Txn: StorageContext> {
-    chain: &'a SyncChain<Txn>,
+struct ChainHandler<'a, Txn: StorageContext, FE, S: CollectionState<Txn = Txn>> {
+    chain: &'a SyncChain<Txn, FE>,
     path: PathBuf,
-    leaf: Box<dyn Handler<'a, State<Txn>> + 'a>,
+    leaf: Box<dyn Handler<'a, S> + 'a>,
 }
 
-impl<Txn: StorageContext + 'static> Route<State<Txn>> for SyncChain<Txn> {
-    fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn Handler<'a, State<Txn>> + 'a>> {
+impl<Txn, FE, S> Route<S> for SyncChain<Txn, FE>
+where
+    Txn: StorageContext + 'static,
+    FE: Send + Sync,
+    S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
+{
+    fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn Handler<'a, S> + 'a>> {
         Some(Box::new(ChainHandler {
             chain: self,
             path: PathBuf::from_slice(path),
@@ -21,8 +26,13 @@ impl<Txn: StorageContext + 'static> Route<State<Txn>> for SyncChain<Txn> {
     }
 }
 
-impl<'a, Txn: StorageContext + 'static> Handler<'a, State<Txn>> for ChainHandler<'a, Txn> {
-    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, State<Txn>>>
+impl<'a, Txn, FE, S> Handler<'a, S> for ChainHandler<'a, Txn, FE, S>
+where
+    Txn: StorageContext + 'static,
+    FE: Send + Sync,
+    S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
+{
+    fn get<'txn>(self: Box<Self>) -> Option<tc_ir::GetHandler<'a, 'txn, S>>
     where
         'txn: 'a,
     {
@@ -37,7 +47,7 @@ impl<'a, Txn: StorageContext + 'static> Handler<'a, State<Txn>> for ChainHandler
         }))
     }
 
-    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, State<Txn>>>
+    fn post<'txn>(self: Box<Self>) -> Option<tc_ir::PostHandler<'a, 'txn, S>>
     where
         'txn: 'a,
     {
@@ -52,7 +62,7 @@ impl<'a, Txn: StorageContext + 'static> Handler<'a, State<Txn>> for ChainHandler
         }))
     }
 
-    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, State<Txn>>>
+    fn put<'txn>(self: Box<Self>) -> Option<tc_ir::PutHandler<'a, 'txn, S>>
     where
         'txn: 'a,
     {
@@ -70,7 +80,7 @@ impl<'a, Txn: StorageContext + 'static> Handler<'a, State<Txn>> for ChainHandler
         }))
     }
 
-    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, State<Txn>>>
+    fn delete<'txn>(self: Box<Self>) -> Option<tc_ir::DeleteHandler<'a, 'txn, S>>
     where
         'txn: 'a,
     {
@@ -80,7 +90,7 @@ impl<'a, Txn: StorageContext + 'static> Handler<'a, State<Txn>> for ChainHandler
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 chain
-                    .mutate(txn, path, key.clone(), None, || delete(txn, key))
+                    .mutate::<S, _, _>(txn, path, key.clone(), None, || delete(txn, key))
                     .await
             })
         }))

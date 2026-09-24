@@ -255,7 +255,7 @@ impl Fixture {
     }
 
     async fn reopen(&self) -> TCResult<SyncChain<Txn>> {
-        SyncChain::load(
+        SyncChain::load::<State<_>, _, _, _, _>(
             || self.canonical(true),
             Self::open_log(&self.path),
             Self::open_values(&self.path),
@@ -287,10 +287,10 @@ async fn insert(chain: &SyncChain<Txn>, txn: &Txn, table: bool, n: u64) -> TCRes
 }
 
 async fn count(chain: &SyncChain<Txn>, txn: &Txn) -> u64 {
-    let state = chain
-        .get(txn, &["count".parse().unwrap()], Value::None.into())
-        .await
-        .unwrap();
+    let state =
+        Public::<State<Txn>>::get(chain, txn, &["count".parse().unwrap()], Value::None.into())
+            .await
+            .unwrap();
     let State::Scalar(tc_ir::Scalar::Value(Value::Number(number))) = state else {
         panic!("invalid count")
     };
@@ -316,7 +316,7 @@ fn delegated_queue_admits_before_capture_and_recovery_ignores_pending_capacity()
                 &f.txn(2),
                 &["insert".parse().unwrap()],
                 Value::None.into(),
-                f.source(false).await.into(),
+                State::from(f.source(false).await),
             )
             .await
             .unwrap_err();
@@ -330,7 +330,7 @@ fn delegated_queue_admits_before_capture_and_recovery_ignores_pending_capacity()
         drop(chain);
 
         let queue = TxnTaskQueue::new(1);
-        let reopened = SyncChain::load(
+        let reopened = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             Fixture::open_log(&f.path),
             Fixture::open_values(&f.path),
@@ -392,7 +392,7 @@ fn constructors_require_fresh_queues_and_distinguish_creation_from_loading() {
                 .is_err()
             );
             assert!(
-                SyncChain::load(
+                SyncChain::load::<State<_>, _, _, _, _>(
                     || f.canonical(true),
                     f.log.clone(),
                     f.values.clone(),
@@ -443,7 +443,7 @@ fn missing_and_corrupt_committed_blocks_fail_closed() {
             // External corruption is inspected through a fresh cache.
             std::fs::write(&path, bytes).unwrap();
             assert!(
-                SyncChain::load(
+                SyncChain::load::<State<_>, _, _, _, _>(
                     || f.canonical(true),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
@@ -482,7 +482,7 @@ fn recovery_rejects_replacement_transaction_ids() {
         .await
         .unwrap();
         drop(chain);
-        let result = SyncChain::load(
+        let result = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             Fixture::open_log(&f.path),
             Fixture::open_values(&f.path),
@@ -519,10 +519,14 @@ fn cancelled_commit_requires_reopening() {
             assert!(chain.rollback(&id(3)).await.is_err());
             assert!(chain.finalize(&id(3)).await.is_err());
             assert!(
-                chain
-                    .get(&f.txn(4), &["count".parse().unwrap()], Value::None.into())
-                    .await
-                    .is_err()
+                Public::<State<Txn>>::get(
+                    &chain,
+                    &f.txn(4),
+                    &["count".parse().unwrap()],
+                    Value::None.into()
+                )
+                .await
+                .is_err()
             );
             assert_eq!(
                 std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
@@ -613,10 +617,14 @@ fn same_transaction_keeps_replay_order_and_cancellation_preserves_failure() {
 
             assert!(chain.commit(txn.id()).await.is_err());
             assert!(
-                chain
-                    .get(&txn, &["count".parse().unwrap()], Value::None.into())
-                    .await
-                    .is_err()
+                Public::<State<Txn>>::get(
+                    &chain,
+                    &txn,
+                    &["count".parse().unwrap()],
+                    Value::None.into()
+                )
+                .await
+                .is_err()
             );
             chain.rollback(&txn.id()).await.unwrap();
             assert_eq!(count(&chain, &f.txn(3)).await, 0);
@@ -661,10 +669,14 @@ fn cutoff_preserves_future_commits_and_discards_pending() {
         insert(&chain, &f.txn(3), true, 3).await.unwrap();
         chain.finalize(&id(3)).await.unwrap();
         assert!(
-            chain
-                .get(&f.txn(3), &["count".parse().unwrap()], Value::None.into())
-                .await
-                .is_err()
+            Public::<State<Txn>>::get(
+                &chain,
+                &f.txn(3),
+                &["count".parse().unwrap()],
+                Value::None.into()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(count(&chain, &f.txn(5)).await, 2);
         drop(chain);
@@ -800,10 +812,14 @@ fn ordered_put_delete_batch_replays_exactly() {
         let chain = f.chain(true).await;
         let txn = f.txn(2);
         insert(&chain, &txn, true, 1).await.unwrap();
-        chain
-            .delete(&txn, &[], Value::Tuple(vec![Value::from(1_u64)]).into())
-            .await
-            .unwrap();
+        Public::<State<Txn>>::delete(
+            &chain,
+            &txn,
+            &[],
+            Value::Tuple(vec![Value::from(1_u64)]).into(),
+        )
+        .await
+        .unwrap();
         insert(&chain, &txn, true, 1).await.unwrap();
         chain.commit(id(2)).await.unwrap();
         drop(chain);
@@ -932,7 +948,7 @@ fn collection_identity_includes_semantic_schema_and_contents() {
         };
         assert!(
             store
-                .capture(&txn, Collection::BTree(view).into())
+                .capture::<State<_>>(&txn, Collection::BTree(view).into())
                 .await
                 .unwrap_err()
                 .to_string()
@@ -955,11 +971,11 @@ fn native_references_are_shared_and_corrupt_captures_are_not_replaced() {
             };
             let source = f.source(table).await;
             let first = store
-                .capture(&f.txn(2), source.clone().into())
+                .capture::<State<_>>(&f.txn(2), source.clone().into())
                 .await
                 .unwrap();
             let second = store
-                .capture(&f.txn(3), f.source(table).await.into())
+                .capture::<State<_>>(&f.txn(3), f.source(table).await.into())
                 .await
                 .unwrap();
             assert_eq!(first, second);
@@ -985,7 +1001,9 @@ fn native_references_are_shared_and_corrupt_captures_are_not_replaced() {
             store.reclaim().await.unwrap();
             assert_eq!(f.values.read().await.len(), 1);
             assert_eq!(read_records(&f.log, id(3)).await.unwrap().len(), 2);
-            let State::Collection(captured) = store.resolve(id(3), second).await.unwrap() else {
+            let State::Collection(captured) =
+                store.resolve::<State<_>>(id(3), second).await.unwrap()
+            else {
                 panic!("expected captured collection");
             };
             captured
@@ -1007,7 +1025,7 @@ fn native_references_are_shared_and_corrupt_captures_are_not_replaced() {
             captured.sync_all().await.unwrap();
             assert!(
                 store
-                    .capture(&f.txn(5), source.clone().into())
+                    .capture::<State<_>>(&f.txn(5), source.clone().into())
                     .await
                     .unwrap_err()
                     .to_string()
@@ -1021,7 +1039,12 @@ fn native_references_are_shared_and_corrupt_captures_are_not_replaced() {
 
             // An interrupted capture may leave an empty directory. Never fill it in on reuse.
             let incomplete = f.values.write().await.create_dir(name.clone()).unwrap();
-            assert!(store.capture(&f.txn(4), source.into()).await.is_err());
+            assert!(
+                store
+                    .capture::<State<_>>(&f.txn(4), source.into())
+                    .await
+                    .is_err()
+            );
             assert!(incomplete.read().await.is_empty());
             assert!(f.values.read().await.get_dir(&name).is_some());
             write_log(&f.log, ChainFile::default()).await;
@@ -1044,7 +1067,7 @@ fn unsupported_collection_references_fail_before_replay() {
             values: f.values.clone(),
         };
         let value = store
-            .capture(&f.txn(2), f.source(false).await.into())
+            .capture::<State<_>>(&f.txn(2), State::from(f.source(false).await))
             .await
             .unwrap();
         let (name, path, schema) = crate::storage::reference(&value).unwrap().unwrap();
@@ -1073,11 +1096,16 @@ fn unsupported_collection_references_fail_before_replay() {
         for value in invalid {
             assert!(
                 store
-                    .capture(&f.txn(2), value.clone().into())
+                    .capture::<State<_>>(&f.txn(2), value.clone().into())
                     .await
                     .is_err()
             );
-            assert!(store.resolve(id(2), value.clone()).await.is_err());
+            assert!(
+                store
+                    .resolve::<State<_>>(id(2), value.clone())
+                    .await
+                    .is_err()
+            );
         }
         let records = vec![
             crate::storage::MutationRecord::Put(
@@ -1101,7 +1129,7 @@ fn unsupported_collection_references_fail_before_replay() {
         .await
         .unwrap();
         retain_records(&f.log, &[id(2), id(3)]).await;
-        let recovered = SyncChain::load(
+        let recovered = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             Fixture::open_log(&f.path),
             Fixture::open_values(&f.path),
@@ -1135,7 +1163,7 @@ fn unsupported_collection_references_fail_before_replay() {
         .unwrap();
         retain_records(&f.log, &[id(2), id(3)]).await;
         assert!(
-            SyncChain::load(
+            SyncChain::load::<State<_>, _, _, _, _>(
                 || f.canonical(true),
                 Fixture::open_log(&f.path),
                 Fixture::open_values(&f.path),
@@ -1177,11 +1205,14 @@ fn native_collection_values_are_copied_and_verified() {
                 values: f.values.clone(),
             };
             let value = store
-                .capture(&txn, State::from(source.clone()))
+                .capture::<State<_>>(&txn, State::from(source.clone()))
                 .await
                 .unwrap();
             assert_eq!(
-                store.capture(&txn, source.clone().into()).await.unwrap(),
+                store
+                    .capture::<State<_>>(&txn, source.clone().into())
+                    .await
+                    .unwrap(),
                 value
             );
             assert_eq!(f.values.read().await.len(), 1);
@@ -1204,7 +1235,10 @@ fn native_collection_values_are_copied_and_verified() {
                 committed: log_file(&Fixture::open_log(&f.path)).await,
                 values: Fixture::open_values(&f.path),
             };
-            let State::Collection(copy) = reopened.resolve(txn.id(), value.clone()).await.unwrap()
+            let State::Collection(copy) = reopened
+                .resolve::<State<_>>(txn.id(), value.clone())
+                .await
+                .unwrap()
             else {
                 panic!("expected collection");
             };
@@ -1236,12 +1270,15 @@ fn native_collection_values_are_copied_and_verified() {
             reopened.values.sync().await.unwrap();
             let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
             assert!(
-                reopened.resolve(txn.id(), value.clone()).await.is_err(),
+                reopened
+                    .resolve::<State<_>>(txn.id(), value.clone())
+                    .await
+                    .is_err(),
                 "changed native rows must fail validation"
             );
             retain_records(&f.log, &[txn.id()]).await;
             assert!(
-                SyncChain::load(
+                SyncChain::load::<State<_>, _, _, _, _>(
                     || f.canonical(false),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
@@ -1271,7 +1308,7 @@ fn native_collection_values_are_copied_and_verified() {
                 )
                 .await;
             reopened.values.sync_deleted().await.unwrap();
-            assert!(reopened.resolve(txn.id(), value).await.is_err());
+            assert!(reopened.resolve::<State<_>>(txn.id(), value).await.is_err());
         }
     });
 }
@@ -1287,7 +1324,7 @@ fn failed_collection_arguments_are_reclaimed_on_load() {
                     &f.txn(3),
                     &["insert".parse().unwrap()],
                     Value::None.into(),
-                    f.source(false).await.into()
+                    State::from(f.source(false).await)
                 )
                 .await
                 .is_err()
@@ -1332,7 +1369,7 @@ fn cleanup_failure_fails_load_without_changing_the_wal() {
                     &f.txn(2),
                     &["insert".parse().unwrap()],
                     Value::None.into(),
-                    f.source(false).await.into(),
+                    State::from(f.source(false).await),
                 )
                 .await
                 .is_err()
@@ -1347,7 +1384,7 @@ fn cleanup_failure_fails_load_without_changing_the_wal() {
         chain.finalize(&id(2)).await.unwrap();
         let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
         drop(chain);
-        let failure = SyncChain::load(
+        let failure = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             Fixture::open_log(&f.path),
             f.values.clone(),
@@ -1413,7 +1450,7 @@ fn collection_reclamation_preserves_the_committed_file_and_published_captures() 
             values: f.values.clone(),
         };
         let value = store
-            .capture(&f.txn(4), f.source(false).await.into())
+            .capture::<State<_>>(&f.txn(4), State::from(f.source(false).await))
             .await
             .unwrap();
         let name = crate::storage::reference(&value)
@@ -1661,7 +1698,7 @@ fn sync_rejects_blocks_outside_its_publication_contract() {
             let path = f.path.join("log/committed.chain_block");
             let original = std::fs::read(&path).unwrap();
             assert!(
-                SyncChain::load(
+                SyncChain::load::<State<_>, _, _, _, _>(
                     || f.canonical(true),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
@@ -1805,7 +1842,7 @@ fn materialization_intent_prevents_loading_replay_and_cleanup() {
                 drop(chain);
                 std::fs::create_dir(f.path.join("values/orphan")).unwrap();
                 let before = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-                let result = SyncChain::<Txn>::load(
+                let result = SyncChain::<Txn>::load::<State<_>, _, _, _, _>(
                     || async { panic!("intent must be checked before native loading") },
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
@@ -1858,7 +1895,7 @@ fn retained_requests_replay_after_workspace_removal_and_repeated_reopening() {
                         .load(workspace)
                         .unwrap();
                 let calls = AtomicUsize::new(0);
-                let chain = SyncChain::load(
+                let chain = SyncChain::load::<State<_>, _, _, _, _>(
                     || f.canonical(true),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
@@ -1933,7 +1970,7 @@ fn retained_history_saturates_and_finalization_restores_capacity() {
         let small = Cache::<ChainFile>::new(2048, None, 0, Duration::from_secs(3))
             .load(f.path.join("log"))
             .unwrap();
-        let chain = SyncChain::load(
+        let chain = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             small,
             Fixture::open_values(&f.path),
@@ -2045,7 +2082,7 @@ fn collection_views_are_not_persistent_subjects() {
         let chain = f.chain(false).await;
         drop(chain);
         assert!(
-            SyncChain::load(
+            SyncChain::load::<State<_>, _, _, _, _>(
                 || async { Ok(Collection::BTree(view)) },
                 Fixture::open_log(&f.path),
                 Fixture::open_values(&f.path),
@@ -2149,7 +2186,7 @@ fn restoration_cancellation_and_unaccepted_replay_preserve_original_identity() {
                 values: f.values.clone(),
             };
             let value = store
-                .capture(&f.txn(3), snapshot.clone().into())
+                .capture::<State<_>>(&f.txn(3), snapshot.clone().into())
                 .await
                 .unwrap();
             let txn = f.txn(3);
@@ -2171,7 +2208,7 @@ fn restoration_cancellation_and_unaccepted_replay_preserve_original_identity() {
             write_records(&f.log, id(4), records).await.unwrap();
             drop(chain);
             let calls = AtomicUsize::new(0);
-            let chain = SyncChain::load(
+            let chain = SyncChain::load::<State<_>, _, _, _, _>(
                 || f.canonical(true),
                 Fixture::open_log(&f.path),
                 Fixture::open_values(&f.path),

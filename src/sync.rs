@@ -2,27 +2,27 @@ use std::sync::Arc;
 
 use freqfs::DirLock;
 use pathlink::PathBuf;
-use tc_collection::{Collection, StorageContext};
+use safecast::TryCastInto;
+use tc_collection::{Collection, CollectionState, StorageContext};
 use tc_error::{TCError, TCResult};
 use tc_ir::{IntoView, Public, Scalar, Sha256Hash, Transact, TxnId};
-use tc_state::State;
 
 use crate::TxnTaskQueue;
-use crate::storage::{self, ChainFile, MutationRecord, Store};
+use crate::storage::{self, ChainFile, ChainFileType, MutationRecord, Store};
 
-pub(crate) struct Inner<Txn: StorageContext> {
+pub(crate) struct Inner<Txn: StorageContext, FE> {
     pub(crate) subject: Collection<Txn>,
-    store: Store<Txn>,
+    store: Store<Txn, FE>,
     queue: TxnTaskQueue<MutationRecord>,
 }
 
 /// A v1-style request WAL around a native persistent collection.
 /// Escaped native collection handles remain outside this log's coverage.
-pub struct SyncChain<Txn: StorageContext> {
-    pub(crate) inner: Arc<Inner<Txn>>,
+pub struct SyncChain<Txn: StorageContext, FE = ChainFile> {
+    pub(crate) inner: Arc<Inner<Txn, FE>>,
 }
 
-impl<Txn: StorageContext> Clone for SyncChain<Txn> {
+impl<Txn: StorageContext, FE> Clone for SyncChain<Txn, FE> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -30,10 +30,10 @@ impl<Txn: StorageContext> Clone for SyncChain<Txn> {
     }
 }
 
-impl<Txn: StorageContext + 'static> SyncChain<Txn> {
+impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
     fn new(
         subject: Collection<Txn>,
-        store: Store<Txn>,
+        store: Store<Txn, FE>,
         queue: TxnTaskQueue<MutationRecord>,
     ) -> Self {
         Self {
@@ -48,7 +48,7 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
     /// Publish an empty WAL around an unpublished canonical subject.
     pub async fn create(
         subject: Collection<Txn>,
-        root: DirLock<ChainFile>,
+        root: DirLock<FE>,
         values: DirLock<Txn::File>,
         queue: TxnTaskQueue<MutationRecord>,
     ) -> TCResult<Self> {
@@ -74,22 +74,19 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
     /// Replay retained requests using original identities and fresh workspaces.
     /// Unfinished materialization requires authoritative resynchronization;
     /// no native loader, replay capability, or cleanup is invoked in that case.
-    pub async fn load<L, Loaded, F, Fut>(
+    pub async fn open<L, Loaded>(
         subject: L,
-        root: DirLock<ChainFile>,
+        root: DirLock<FE>,
         values: DirLock<Txn::File>,
         queue: TxnTaskQueue<MutationRecord>,
-        mut transaction: F,
     ) -> TCResult<Self>
     where
         L: FnOnce() -> Loaded,
         Loaded: std::future::Future<Output = TCResult<Collection<Txn>>>,
-        F: FnMut(TxnId) -> Fut,
-        Fut: std::future::Future<Output = TCResult<Txn>>,
     {
         queue.validate_fresh()?;
         let file = storage::load(&root).await?;
-        let committed = file.read().await?.clone();
+        let committed = file.read::<ChainFile>().await?.clone();
         if committed.materializing.is_some() {
             return Err(TCError::bad_request(
                 "recovery required: unfinished canonical materialization; authoritative resynchronization is required",
@@ -117,18 +114,42 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
             },
             queue,
         );
-        let mut operation = chain.inner.queue.operation()?;
-
         // Validate every record and stored collection before invoking any mutation handler.
         for (id, records) in &committed.block.mutations {
             for value in records.iter().filter_map(MutationRecord::value) {
-                chain.inner.store.resolve(*id, value.clone()).await?;
+                if storage::reference(value)?.is_some() {
+                    chain
+                        .inner
+                        .store
+                        .resolve_collection(*id, value.clone())
+                        .await?;
+                }
             }
         }
 
+        Ok(chain)
+    }
+
+    /// Replay an opened, unpublished owner after the caller has assembled its runtime.
+    /// Readiness and transaction expiry must remain stopped until this succeeds.
+    pub async fn recover<S, F, Fut>(&self, mut transaction: F) -> TCResult<()>
+    where
+        S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
+        F: FnMut(TxnId) -> Fut,
+        Fut: std::future::Future<Output = TCResult<Txn>>,
+    {
+        self.inner.queue.validate_fresh()?;
+        let committed = self
+            .inner
+            .store
+            .committed
+            .read::<ChainFile>()
+            .await?
+            .clone();
+        let mut operation = self.inner.queue.operation()?;
         operation.arm();
         if let Some(frontier) = committed.finalized {
-            chain.inner.subject.finalize(&frontier).await?;
+            self.inner.subject.finalize(&frontier).await?;
             operation.finalize(frontier)?;
         }
 
@@ -143,28 +164,23 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
             for record in records {
                 match record {
                     MutationRecord::Restore(value) => {
-                        let State::Collection(snapshot) =
-                            chain.inner.store.resolve(id, value).await?
-                        else {
-                            return Err(TCError::bad_request("invalid restoration snapshot"));
-                        };
-                        chain.inner.subject.restore_from(&txn, &snapshot).await?;
+                        let snapshot = self.inner.store.resolve_collection(id, value).await?;
+                        self.inner.subject.restore_from(&txn, &snapshot).await?;
                     }
                     MutationRecord::Put(path, key, value) => {
-                        chain
-                            .inner
+                        self.inner
                             .subject
                             .put(
                                 &txn,
                                 &path,
                                 key,
-                                chain.inner.store.resolve(id, value).await?,
+                                self.inner.store.resolve::<S>(id, value).await?,
                             )
                             .await?
                     }
                     MutationRecord::Delete(path, key) => {
-                        <Collection<Txn> as Public<State<Txn>>>::delete(
-                            &chain.inner.subject,
+                        <Collection<Txn> as Public<S>>::delete(
+                            &self.inner.subject,
                             &txn,
                             &path,
                             key,
@@ -173,32 +189,51 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
                     }
                 }
             }
-            chain.inner.subject.commit(id).await?;
+            self.inner.subject.commit(id).await?;
             operation.commit(&id)?;
         }
 
-        chain.inner.store.reclaim().await?;
-        root.sync_deleted().await?;
+        self.inner.store.reclaim().await?;
         operation.complete();
-        Ok(chain)
+        Ok(())
     }
 
+    /// Open, validate, and recover using caller-supplied original-ID capabilities.
+    pub async fn load<S, L, Loaded, F, Fut>(
+        subject: L,
+        root: DirLock<FE>,
+        values: DirLock<Txn::File>,
+        queue: TxnTaskQueue<MutationRecord>,
+        transaction: F,
+    ) -> TCResult<Self>
+    where
+        S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
+        L: FnOnce() -> Loaded,
+        Loaded: std::future::Future<Output = TCResult<Collection<Txn>>>,
+        F: FnMut(TxnId) -> Fut,
+        Fut: std::future::Future<Output = TCResult<Txn>>,
+    {
+        let chain = Self::open(subject, root.clone(), values, queue).await?;
+        chain.recover::<S, _, _>(transaction).await?;
+        root.sync_deleted().await?;
+        Ok(chain)
+    }
+}
+
+impl<Txn: StorageContext + 'static, FE: Send + Sync> SyncChain<Txn, FE> {
     /// Record and stage a native replacement using a caller-supplied snapshot.
     pub async fn restore_from(&self, txn: &Txn, snapshot: &Collection<Txn>) -> TCResult<()> {
         let mut task = self.inner.queue.start(txn.id())?;
         let reference = self
             .inner
             .store
-            .capture(txn, State::from(snapshot.clone()))
+            .capture_collection(txn, snapshot.clone())
             .await?;
-        let State::Collection(captured) = self
+        let captured = self
             .inner
             .store
-            .resolve(txn.id(), reference.clone())
-            .await?
-        else {
-            return Err(TCError::bad_request("invalid restoration snapshot"));
-        };
+            .resolve_collection(txn.id(), reference.clone())
+            .await?;
         task.record(MutationRecord::Restore(reference))?;
         self.inner.subject.restore_from(txn, &captured).await?;
         task.complete().map_err(Into::into)
@@ -219,15 +254,16 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
         self.inner.queue.readable(txn.id()).map_err(Into::into)
     }
 
-    pub(crate) async fn mutate<F, Fut>(
+    pub(crate) async fn mutate<S, F, Fut>(
         &self,
         txn: &Txn,
         path: PathBuf,
         key: Scalar,
-        value: Option<State<Txn>>,
+        value: Option<S>,
         selected: F,
     ) -> TCResult<()>
     where
+        S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = TCResult<()>> + Send,
     {
@@ -246,7 +282,7 @@ impl<Txn: StorageContext + 'static> SyncChain<Txn> {
     }
 }
 
-impl<Txn: StorageContext + 'static> IntoView for SyncChain<Txn> {
+impl<Txn: StorageContext + 'static, FE: Send + Sync> IntoView for SyncChain<Txn, FE> {
     type Txn = Txn;
     type View = tc_collection::CollectionView;
 
@@ -256,14 +292,20 @@ impl<Txn: StorageContext + 'static> IntoView for SyncChain<Txn> {
     }
 }
 
-impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
+impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Txn, FE> {
     async fn commit(&self, id: TxnId) -> TCResult<()> {
         let mut operation = self.inner.queue.operation()?;
         let Some(records) = operation.commit(&id)? else {
             return Ok(());
         };
         if !records.is_empty() {
-            let mut committed = self.inner.store.committed.read().await?.clone();
+            let mut committed = self
+                .inner
+                .store
+                .committed
+                .read::<ChainFile>()
+                .await?
+                .clone();
             self.inner.store.sync(&records).await?;
             if committed.block.mutations.insert(id, records).is_some() {
                 return Err(TCError::conflict("transaction already published"));
@@ -294,7 +336,7 @@ impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
         let mut operation = self.inner.queue.operation()?;
         operation.check_finalize(cutoff)?;
         let mut committed = {
-            let committed = self.inner.store.committed.read().await?;
+            let committed = self.inner.store.committed.read::<ChainFile>().await?;
             if committed.finalized.is_some_and(|prior| *cutoff <= prior) {
                 return Ok(());
             }
@@ -319,5 +361,13 @@ impl<Txn: StorageContext + 'static> Transact for SyncChain<Txn> {
         operation.finalize(*cutoff)?;
         operation.complete();
         Ok(())
+    }
+}
+
+impl<Txn: StorageContext + std::fmt::Debug, FE> std::fmt::Debug for SyncChain<Txn, FE> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SyncChain")
+            .field(&self.inner.subject)
+            .finish()
     }
 }

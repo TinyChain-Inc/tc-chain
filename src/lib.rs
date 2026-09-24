@@ -5,7 +5,7 @@ mod public;
 mod storage;
 mod sync;
 
-pub use storage::{ChainFile, MutationRecord};
+pub use storage::{ChainFile, ChainFileType, MutationRecord};
 
 /// Caller-configured pending work preserving the protocol transaction identity.
 pub type TxnTaskQueue<T> = txn_lock::queue::task::TaskQueue<tc_ir::TxnId, T>;

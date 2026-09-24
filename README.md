@@ -41,7 +41,7 @@ Use ordinary `Route<State>`, `Public<State>`, `IntoView`, and `Transact`.
 same WAL and transactional Collection boundary; kind and schema must match.
 
 Reopen WAL and value-store handles through fresh caller-owned caches and call
-`SyncChain::load(subject_loader, wal, values, fresh_queue, resolver)`. The async
+`SyncChain::load::<State<_>, _, _, _, _>(subject_loader, wal, values, fresh_queue, resolver)`. The async
 loader strictly loads the subject only after Chain checks for unfinished
 materialization. The resolver supplies original-ID capabilities and fresh delegated
 workspaces. Chain never constructs caches, chooses host paths, or allocates IDs.

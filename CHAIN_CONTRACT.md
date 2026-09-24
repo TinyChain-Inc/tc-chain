@@ -243,6 +243,13 @@ retained transaction is replayed in original order into fresh caller-delegated
 workspaces with its original ID, then committed in memory. Recovery retains the WAL.
 Only successful recovery permits orphaned capture cleanup.
 
+Callers which must assemble an execution runtime before replay use `open` followed
+by `recover`. The opened owner remains unpublished: no requests, expiry processing,
+or readiness announcement may run before recovery succeeds. `load` delegates to
+these same operations. Native invocation is generic over the caller's State;
+the delegated WAL file composition implements `ChainFileType`. Chain owns the
+record codec and checksum framing regardless of that composition.
+
 Interrupted in-place materialization cannot be repaired by ordinary request replay
 or native restoration. The resource remains unavailable. Future Service/Cluster
 integration must select authoritative state using authenticated resource membership
