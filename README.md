@@ -5,9 +5,6 @@ reconciliation semantics. `SyncChain` provides a PUT/DELETE write-ahead
 log for BTree and Table subjects. The canonical [Chain contract](CHAIN_CONTRACT.md)
 defines durability, recovery, and ownership.
 
-[Crate-level acceptance evidence](ACCEPTANCE.md) records recovery tests and
-durability measurements for Issue #2.
-
 Chain does not replace resource routing, host transaction allocation, or local
 collection behavior. A Service owns a public named resource, a Cluster owns its
 leadership and propagation, Chain owns ordered replayable history, and the

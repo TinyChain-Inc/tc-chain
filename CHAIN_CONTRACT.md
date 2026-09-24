@@ -1,7 +1,7 @@
 # Chain contract
 
 This document defines the ownership boundary for TinyChain durable history and
-the SyncChain write-ahead log. Public Service hosting is a separate integration.
+the SyncChain write-ahead log. Public Service hosting is owned by the caller.
 
 ## Ownership
 
@@ -301,6 +301,8 @@ backpressure, cancellation, materialization, and resynchronization through the
 same Service and Cluster path.
 
 Crate-level SyncChain support covers BTree and Table recovery and failure boundaries.
-Executable Services, automatic authoritative resynchronization, host readiness,
-cross-host synchronization, and persistent Tensor subjects remain outside that
-support claim.
+Executable Services, host readiness, and authenticated snapshot transport belong
+to the integrating host. This crate exposes generic native State/file delegation,
+unpublished opening followed by recovery, and transactional restoration for those
+owners. Automatic authoritative replacement of damaged storage and persistent
+Tensor subjects remain unsupported.
