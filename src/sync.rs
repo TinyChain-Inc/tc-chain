@@ -62,7 +62,7 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
         }
 
         queue.validate_fresh()?;
-        let mut operation = queue.operation()?;
+        let mut operation = queue.operation().await?;
         operation.arm();
         subject.sync_all().await?;
         let committed = storage::create(&root).await?;
@@ -146,7 +146,7 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
             .read::<ChainFile>()
             .await?
             .clone();
-        let mut operation = self.inner.queue.operation()?;
+        let mut operation = self.inner.queue.operation().await?;
         operation.arm();
         if let Some(frontier) = committed.finalized {
             self.inner.subject.finalize(&frontier).await?;
@@ -223,7 +223,7 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
 impl<Txn: StorageContext + 'static, FE: Send + Sync> SyncChain<Txn, FE> {
     /// Record and stage a native replacement using a caller-supplied snapshot.
     pub async fn restore_from(&self, txn: &Txn, snapshot: &Collection<Txn>) -> TCResult<()> {
-        let mut task = self.inner.queue.start(txn.id())?;
+        let mut task = self.inner.queue.start(txn.id()).await?;
         let reference = self
             .inner
             .store
@@ -267,7 +267,7 @@ impl<Txn: StorageContext + 'static, FE: Send + Sync> SyncChain<Txn, FE> {
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = TCResult<()>> + Send,
     {
-        let mut task = self.inner.queue.start(txn.id())?;
+        let mut task = self.inner.queue.start(txn.id()).await?;
 
         let record = match value {
             Some(value) => {
@@ -294,7 +294,7 @@ impl<Txn: StorageContext + 'static, FE: Send + Sync> IntoView for SyncChain<Txn,
 
 impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Txn, FE> {
     async fn commit(&self, id: TxnId) -> TCResult<()> {
-        let mut operation = self.inner.queue.operation()?;
+        let mut operation = self.inner.queue.operation().await?;
         let Some(records) = operation.commit(&id)? else {
             return Ok(());
         };
@@ -320,7 +320,7 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Tx
     }
 
     async fn rollback(&self, id: &TxnId) -> TCResult<()> {
-        let mut operation = self.inner.queue.operation()?;
+        let mut operation = self.inner.queue.operation().await?;
         if !operation.check_rollback(id)? {
             return Ok(());
         }
@@ -333,7 +333,7 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Tx
     }
 
     async fn finalize(&self, cutoff: &TxnId) -> TCResult<()> {
-        let mut operation = self.inner.queue.operation()?;
+        let mut operation = self.inner.queue.operation().await?;
         operation.check_finalize(cutoff)?;
         let mut committed = {
             let committed = self.inner.store.committed.read::<ChainFile>().await?;

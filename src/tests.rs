@@ -364,7 +364,7 @@ fn constructors_require_fresh_queues_and_distinguish_creation_from_loading() {
             let subject = f.canonical(false).await.unwrap();
             let queue = TxnTaskQueue::new(1);
             if finalized {
-                queue.operation().unwrap().finalize(id(1)).unwrap();
+                queue.operation().await.unwrap().finalize(id(1)).unwrap();
             } else {
                 queue.register(id(1)).unwrap();
             }
@@ -495,6 +495,50 @@ fn recovery_rejects_replacement_transaction_ids() {
 }
 
 #[test]
+fn finalization_waits_serialize_newer_mutations_and_commits() {
+    run(|| async {
+        for table in [false, true] {
+            for pending_commit in [false, true] {
+                let f = Fixture::new();
+                let chain = f.chain(table).await;
+                insert(&chain, &f.txn(2), table, 1).await.unwrap();
+                chain.commit(id(2)).await.unwrap();
+                let txn = f.txn(3);
+                if pending_commit {
+                    insert(&chain, &txn, table, 2).await.unwrap();
+                }
+
+                let file = log_file(&f.log).await;
+                let guard = file.write().await.unwrap();
+                let cutoff = id(2);
+                let mut finalization = Box::pin(chain.finalize(&cutoff));
+                assert!(futures::poll!(&mut finalization).is_pending());
+                assert_eq!(count(&chain, &txn).await, 1 + u64::from(pending_commit));
+                let mut request = Box::pin(async {
+                    if !pending_commit {
+                        insert(&chain, &txn, table, 2).await?;
+                    }
+                    chain.commit(txn.id()).await
+                });
+                assert!(futures::poll!(&mut request).is_pending());
+                drop(guard);
+                finalization.await.unwrap();
+                request.await.unwrap();
+                assert_eq!(count(&chain, &f.txn(4)).await, 2);
+                assert!(
+                    read_log(&f.log)
+                        .await
+                        .unwrap()
+                        .block
+                        .mutations
+                        .contains_key(&id(3))
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn cancelled_commit_requires_reopening() {
     run(|| async {
         for table in [false, true] {
@@ -509,7 +553,7 @@ fn cancelled_commit_requires_reopening() {
             let guard = file.write().await.unwrap();
             let mut commit = Box::pin(chain.commit(id(3)));
             assert!(futures::poll!(&mut commit).is_pending());
-            assert!(chain.rollback(&id(3)).await.is_err());
+            assert!(futures::poll!(Box::pin(chain.rollback(&id(3)))).is_pending());
             drop(commit);
             drop(guard);
 
@@ -609,9 +653,15 @@ fn same_transaction_keeps_replay_order_and_cancellation_preserves_failure() {
             let mut first = Box::pin(chain.put(&txn, &path, Value::None.into(), value));
             assert!(futures::poll!(&mut first).is_pending());
             assert!(insert(&chain, &txn, false, 2).await.is_err());
-            assert!(chain.commit(txn.id()).await.is_err());
-            assert!(chain.rollback(&txn.id()).await.is_err());
-            assert!(chain.finalize(&txn.id()).await.is_err());
+            if capture {
+                assert!(futures::poll!(Box::pin(chain.commit(txn.id()))).is_pending());
+                assert!(futures::poll!(Box::pin(chain.rollback(&txn.id()))).is_pending());
+                assert!(futures::poll!(Box::pin(chain.finalize(&txn.id()))).is_pending());
+            } else {
+                assert!(chain.commit(txn.id()).await.is_err());
+                assert!(chain.rollback(&txn.id()).await.is_err());
+                assert!(chain.finalize(&txn.id()).await.is_err());
+            }
             drop(first);
             drop(guard);
 

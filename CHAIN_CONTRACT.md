@@ -215,7 +215,9 @@ errors still propagate.
 
 Capture and lifecycle preparation remain exclusive. Capture exclusion prevents
 reuse of an incompletely copied argument; live lifecycle methods do not reclaim
-captures. This exclusion ends before the selected
+captures. Admission awaits the queue's semaphore rather than returning a conflict
+for ordinary publication contention. Waiting registers no work; interruption of
+an armed lifecycle closes the semaphore and requires reopening. This exclusion ends before the selected
 collection handler executes. It is WAL storage coordination, not collection
 conflict detection. Publication and interruption protection remain unchanged.
 A further v1 integration port must address native collection copying and
