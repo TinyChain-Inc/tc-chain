@@ -5,9 +5,6 @@ reconciliation semantics. `SyncChain` provides a PUT/DELETE write-ahead
 log for BTree and Table subjects. The canonical [Chain contract](CHAIN_CONTRACT.md)
 defines durability, recovery, and ownership.
 
-[Crate-level acceptance evidence](ACCEPTANCE.md) records recovery tests and
-durability measurements for Issue #2.
-
 Chain does not replace resource routing, host transaction allocation, or local
 collection behavior. A Service owns a public named resource, a Cluster owns its
 leadership and propagation, Chain owns ordered replayable history, and the
@@ -41,7 +38,7 @@ Use ordinary `Route<State>`, `Public<State>`, `IntoView`, and `Transact`.
 same WAL and transactional Collection boundary; kind and schema must match.
 
 Reopen WAL and value-store handles through fresh caller-owned caches and call
-`SyncChain::load(subject_loader, wal, values, fresh_queue, resolver)`. The async
+`SyncChain::load::<State<_>, _, _, _, _>(subject_loader, wal, values, fresh_queue, resolver)`. The async
 loader strictly loads the subject only after Chain checks for unfinished
 materialization. The resolver supplies original-ID capabilities and fresh delegated
 workspaces. Chain never constructs caches, chooses host paths, or allocates IDs.

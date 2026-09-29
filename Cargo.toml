@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+get-size = "0.1"
 bytes = "1"
 destream = { path = "../deps/destream" }
 destream_json = { path = "../deps/destream_json", default-features = false }
@@ -15,7 +16,6 @@ sha2 = "0.10"
 tc-collection = { path = "../tc-collection" }
 tc-error = { path = "../tc-error" }
 tc-ir = { path = "../tc-ir" }
-tc-state = { path = "../tc-state" }
 tc-value = { path = "../tc-value" }
 tokio = { version = "1", features = ["fs", "io-util", "sync", "rt", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -23,5 +23,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 txn_lock = { path = "../deps/txn_lock" }
 
 [dev-dependencies]
+tc-state = { path = "../tc-state" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }

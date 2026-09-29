@@ -6,15 +6,14 @@ use destream::{IntoStream, de, en};
 use freqfs::{DirLock, FileLoad, FileLock, FileSave};
 use futures::{StreamExt, TryStreamExt};
 use pathlink::PathBuf;
-use safecast::{AsType, TryCastFrom};
+use safecast::{AsType, TryCastFrom, TryCastInto};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
-use tc_collection::{Collection, StorageContext, collection::CollectionSchema};
+use tc_collection::{Collection, CollectionState, StorageContext, collection::CollectionSchema};
 use tc_error::{TCError, TCResult};
 use tc_ir::{Id, IdRef, OpRef, Scalar, Sha256Hash, Subject, TCRef, TxnId};
-use tc_state::State;
 use tc_value::Value;
 
 pub(crate) const COMMITTED: &str = "committed.chain_block";
@@ -213,52 +212,66 @@ impl de::FromStream for ChainBlock {
     }
 }
 
-pub(crate) struct Store<Txn: StorageContext> {
-    pub committed: FileLock<ChainFile>,
+pub(crate) struct Store<Txn: StorageContext, FE = ChainFile> {
+    pub committed: FileLock<FE>,
     pub values: DirLock<Txn::File>,
 }
 
-impl<Txn: StorageContext + 'static> Store<Txn> {
-    pub async fn capture(&self, txn: &Txn, value: State<Txn>) -> TCResult<Scalar> {
-        let value = match value {
-            State::Collection(source) => {
-                let name = identity(&source, txn.id()).await?;
-                let (path, schema): (PathBuf, Value) = source.schema()?.into();
-                let value = Scalar::from(TCRef::Op(OpRef::Get((
-                    Subject::Ref(IdRef::new(name.clone()), path),
-                    schema.into(),
-                ))));
-
-                let target = {
-                    let mut values = self.values.write().await;
-                    if values.contains(name.as_str()) {
-                        None
-                    } else {
-                        Some(values.create_dir(name.to_string())?)
-                    }
-                };
-                if let Some(dir) = target {
-                    source.copy_into(txn, dir).await?;
-                }
-
-                value
-            }
-            value => Scalar::try_cast_from(value, |_| {
-                TCError::bad_request("mutation values must be scalars or collections")
-            })?,
+impl<Txn: StorageContext + 'static, FE> Store<Txn, FE> {
+    pub async fn capture<S>(&self, txn: &Txn, value: S) -> TCResult<Scalar>
+    where
+        S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
+    {
+        let value = if value.can_cast_into() {
+            self.capture_collection(txn, value.opt_cast_into().expect("collection value"))
+                .await?
+        } else {
+            value.into_scalar()?
         };
 
         // Verify reused storage and that a new native copy preserves the identity.
         if matches!(&value, Scalar::Ref(_)) {
-            self.resolve(txn.id(), value.clone()).await?;
+            self.resolve_collection(txn.id(), value.clone()).await?;
         }
         Ok(value)
     }
 
-    pub async fn resolve(&self, id: TxnId, value: Scalar) -> TCResult<State<Txn>> {
-        let Some((name, path, schema)) = reference(&value)? else {
-            return Ok(State::from(value));
+    pub async fn capture_collection(&self, txn: &Txn, source: Collection<Txn>) -> TCResult<Scalar> {
+        let name = identity(&source, txn.id()).await?;
+        let (path, schema): (PathBuf, Value) = source.schema()?.into();
+        let value = Scalar::from(TCRef::Op(OpRef::Get((
+            Subject::Ref(IdRef::new(name.clone()), path),
+            schema.into(),
+        ))));
+
+        let target = {
+            let mut values = self.values.write().await;
+            if values.contains(name.as_str()) {
+                None
+            } else {
+                Some(values.create_dir(name.to_string())?)
+            }
         };
+        if let Some(dir) = target {
+            source.copy_into(txn, dir).await?;
+        }
+        Ok(value)
+    }
+
+    pub async fn resolve<S>(&self, id: TxnId, value: Scalar) -> TCResult<S>
+    where
+        S: From<Scalar> + From<Collection<Txn>>,
+    {
+        if reference(&value)?.is_some() {
+            self.resolve_collection(id, value).await.map(S::from)
+        } else {
+            Ok(S::from(value))
+        }
+    }
+
+    pub async fn resolve_collection(&self, id: TxnId, value: Scalar) -> TCResult<Collection<Txn>> {
+        let (name, path, schema) = reference(&value)?
+            .ok_or_else(|| TCError::bad_request("expected stored collection reference"))?;
         let schema = Value::try_cast_from(schema.clone(), |_| {
             TCError::bad_request("invalid collection schema")
         })?;
@@ -273,12 +286,10 @@ impl<Txn: StorageContext + 'static> Store<Txn> {
             .cloned()
             .ok_or_else(|| TCError::bad_request("missing stored collection"))?;
         let collection = Collection::<Txn>::load(dir, schema).await?;
-
         if identity(&collection, id).await? != *name {
             return Err(TCError::bad_request("stored collection checksum mismatch"));
         }
-
-        Ok(State::from(collection))
+        Ok(collection)
     }
 
     pub async fn sync(&self, records: &[MutationRecord]) -> TCResult<()> {
@@ -294,11 +305,13 @@ impl<Txn: StorageContext + 'static> Store<Txn> {
         }
         Ok(())
     }
+}
 
+impl<Txn: StorageContext + 'static, FE: ChainFileType> Store<Txn, FE> {
     /// Reclaim orphans after recovery, before exposing the loaded Chain to requests.
     pub(super) async fn reclaim(&self) -> TCResult<()> {
         let retained = {
-            let committed = self.committed.read().await?;
+            let committed = self.committed.read::<ChainFile>().await?;
             references(committed.block.mutations.values().flatten())?
         };
         let names = self
@@ -321,12 +334,50 @@ impl<Txn: StorageContext + 'static> Store<Txn> {
     }
 }
 
+/// A delegated file composition containing Chain's semantic WAL record.
+pub trait ChainFileType:
+    Clone + FileLoad + FileSave + AsType<ChainFile> + From<ChainFile> + Send + Sync + 'static
+{
+}
+
+impl<T> ChainFileType for T where
+    T: Clone + FileLoad + FileSave + AsType<ChainFile> + From<ChainFile> + Send + Sync + 'static
+{
+}
+
+impl get_size::GetSize for MutationRecord {
+    fn get_size(&self) -> usize {
+        match self {
+            Self::Restore(value) => value.get_size(),
+            Self::Put(path, key, value) => path.get_size() + key.get_size() + value.get_size(),
+            Self::Delete(path, key) => path.get_size() + key.get_size(),
+        }
+    }
+}
+
 /// Filesystem encoding and checksum boundary for the committed semantic block.
 #[derive(Clone)]
 pub struct ChainFile {
     pub(crate) finalized: Option<TxnId>,
     pub(crate) materializing: Option<TxnId>,
     pub(crate) block: ChainBlock,
+}
+
+impl get_size::GetSize for ChainFile {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .block
+                .mutations
+                .values()
+                .map(|records| {
+                    records
+                        .iter()
+                        .map(get_size::GetSize::get_size)
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
 }
 
 impl Default for ChainFile {
@@ -437,7 +488,7 @@ impl ChainFile {
     }
 }
 
-pub(crate) async fn load(root: &DirLock<ChainFile>) -> TCResult<FileLock<ChainFile>> {
+pub(crate) async fn load<FE: Send + Sync>(root: &DirLock<FE>) -> TCResult<FileLock<FE>> {
     root.read()
         .await
         .get_file(COMMITTED)
@@ -445,7 +496,7 @@ pub(crate) async fn load(root: &DirLock<ChainFile>) -> TCResult<FileLock<ChainFi
         .ok_or_else(|| TCError::bad_request("missing committed SyncChain block"))
 }
 
-pub(crate) async fn create(root: &DirLock<ChainFile>) -> TCResult<FileLock<ChainFile>> {
+pub(crate) async fn create<FE: ChainFileType>(root: &DirLock<FE>) -> TCResult<FileLock<FE>> {
     let value = ChainFile::default();
     let size = value.size().await?;
     let file = root
@@ -457,9 +508,12 @@ pub(crate) async fn create(root: &DirLock<ChainFile>) -> TCResult<FileLock<Chain
     Ok(file)
 }
 
-pub(crate) async fn publish(file: &FileLock<ChainFile>, value: ChainFile) -> TCResult<()> {
+pub(crate) async fn publish<FE: ChainFileType>(
+    file: &FileLock<FE>,
+    value: ChainFile,
+) -> TCResult<()> {
     let size = value.size().await?;
-    file.replace_all(value, size).await?;
+    file.replace_all(FE::from(value), size).await?;
     Ok(())
 }
 

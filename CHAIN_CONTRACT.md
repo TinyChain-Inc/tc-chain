@@ -1,7 +1,7 @@
 # Chain contract
 
 This document defines the ownership boundary for TinyChain durable history and
-the SyncChain write-ahead log. Public Service hosting is a separate integration.
+the SyncChain write-ahead log. Public Service hosting is owned by the caller.
 
 ## Ownership
 
@@ -215,7 +215,9 @@ errors still propagate.
 
 Capture and lifecycle preparation remain exclusive. Capture exclusion prevents
 reuse of an incompletely copied argument; live lifecycle methods do not reclaim
-captures. This exclusion ends before the selected
+captures. Admission awaits the queue's semaphore rather than returning a conflict
+for ordinary publication contention. Waiting registers no work; interruption of
+an armed lifecycle closes the semaphore and requires reopening. This exclusion ends before the selected
 collection handler executes. It is WAL storage coordination, not collection
 conflict detection. Publication and interruption protection remain unchanged.
 A further v1 integration port must address native collection copying and
@@ -242,6 +244,13 @@ are requested. Collection and queue cutoffs are initialized from the WAL. Every
 retained transaction is replayed in original order into fresh caller-delegated
 workspaces with its original ID, then committed in memory. Recovery retains the WAL.
 Only successful recovery permits orphaned capture cleanup.
+
+Callers which must assemble an execution runtime before replay use `open` followed
+by `recover`. The opened owner remains unpublished: no requests, expiry processing,
+or readiness announcement may run before recovery succeeds. `load` delegates to
+these same operations. Native invocation is generic over the caller's State;
+the delegated WAL file composition implements `ChainFileType`. Chain owns the
+record codec and checksum framing regardless of that composition.
 
 Interrupted in-place materialization cannot be repaired by ordinary request replay
 or native restoration. The resource remains unavailable. Future Service/Cluster
@@ -294,6 +303,8 @@ backpressure, cancellation, materialization, and resynchronization through the
 same Service and Cluster path.
 
 Crate-level SyncChain support covers BTree and Table recovery and failure boundaries.
-Executable Services, automatic authoritative resynchronization, host readiness,
-cross-host synchronization, and persistent Tensor subjects remain outside that
-support claim.
+Executable Services, host readiness, and authenticated snapshot transport belong
+to the integrating host. This crate exposes generic native State/file delegation,
+unpublished opening followed by recovery, and transactional restoration for those
+owners. Automatic authoritative replacement of damaged storage and persistent
+Tensor subjects remain unsupported.
