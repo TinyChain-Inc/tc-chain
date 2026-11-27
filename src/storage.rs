@@ -1,20 +1,27 @@
-//! Typed WAL files. Encoding and checksums stay at the filesystem boundary.
+//! Typed transaction history and native captures. Encoding stays at the file boundary.
 
-use std::{collections::BTreeMap, io, path::Path};
+use std::collections::BTreeMap;
+use std::io;
+use std::ops::Bound::{Excluded, Unbounded};
+use std::path::Path;
+use std::sync::Arc;
 
 use destream::{IntoStream, de, en};
-use freqfs::{DirLock, FileLoad, FileLock, FileSave};
-use futures::{StreamExt, TryStreamExt};
+use freqfs::{Dir, DirLock, FileLoad, FileLock, FileSave};
+use futures::TryStreamExt;
 use pathlink::PathBuf;
-use safecast::{AsType, TryCastFrom, TryCastInto};
+use safecast::{AsType, TryCastInto};
 use sha2::{Digest, Sha256};
+use tc_collection::collection::CollectionSchema;
+use tc_collection::{Collection, CollectionState, CopyFrom, StorageContext};
+use tc_error::{TCError, TCResult};
+use tc_ir::{Id, Scalar, Sha256Hash, TxnId};
+use tc_value::Value;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
-use tc_collection::{Collection, CollectionState, StorageContext, collection::CollectionSchema};
-use tc_error::{TCError, TCResult};
-use tc_ir::{Id, IdRef, OpRef, Scalar, Sha256Hash, Subject, TCRef, TxnId};
-use tc_value::Value;
+#[cfg(test)]
+mod decoding_tests;
 
 pub(crate) const COMMITTED: &str = "committed.chain_block";
 
@@ -22,45 +29,182 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-/// Only scoped GET references to hash-addressed native collections are stored references.
-pub(crate) fn reference(value: &Scalar) -> TCResult<Option<(&Id, &PathBuf, &Scalar)>> {
-    let Scalar::Ref(reference) = value else {
-        return Ok(None);
-    };
-    match reference.as_ref() {
-        TCRef::Op(OpRef::Get((Subject::Ref(id, path), schema)))
-            if id.as_str().len() == 64
-                && id
-                    .as_str()
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-        {
-            Ok(Some((id.id(), path, schema)))
-        }
-        _ => Err(TCError::bad_request("invalid stored collection reference")),
+pub(crate) fn transaction_name(id: TxnId) -> String {
+    format!("{id}.chain_block")
+}
+
+fn transaction_id(name: &str) -> TCResult<TxnId> {
+    let id: TxnId = name
+        .strip_suffix(".chain_block")
+        .ok_or_else(|| TCError::bad_request("invalid Chain transaction filename"))?
+        .parse()
+        .map_err(TCError::bad_request)?;
+
+    if transaction_name(id) != name {
+        return Err(TCError::bad_request(
+            "noncanonical Chain transaction filename",
+        ));
+    }
+
+    Ok(id)
+}
+
+/// Description of an immutable, transaction-owned native collection capture.
+#[derive(Clone)]
+pub struct CapturedCollection {
+    id: Id,
+    class: PathBuf,
+    schema: Value,
+    hash: Sha256Hash,
+}
+
+impl CapturedCollection {
+    fn schema(&self) -> TCResult<CollectionSchema> {
+        CollectionSchema::try_from((self.class.clone(), self.schema.clone())).map_err(|error| {
+            TCError::bad_request("invalid captured collection schema").consume(error)
+        })
     }
 }
 
-async fn identity<Txn: StorageContext>(collection: &Collection<Txn>, id: TxnId) -> TCResult<Id> {
-    let hash = collection.hash(id).await?;
-    Ok(format!("{hash:x}")
-        .parse()
-        .expect("hexadecimal collection identity"))
+impl<'en> en::ToStream<'en> for CapturedCollection {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        (
+            &self.id,
+            &self.class,
+            &self.schema,
+            bytes::Bytes::copy_from_slice(&self.hash),
+        )
+            .into_stream(encoder)
+    }
+}
+
+impl<'en> en::IntoStream<'en> for CapturedCollection {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        (
+            self.id,
+            self.class,
+            self.schema,
+            bytes::Bytes::copy_from_slice(&self.hash),
+        )
+            .into_stream(encoder)
+    }
+}
+
+impl de::FromStream for CapturedCollection {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
+        let (id, class, schema, hash) =
+            <(Id, PathBuf, Value, bytes::Bytes)>::from_stream((), decoder).await?;
+
+        let hash = <[u8; 32]>::try_from(hash.as_ref()).map_err(de::Error::custom)?;
+        let value = Self {
+            id,
+            class,
+            schema,
+            hash: hash.into(),
+        };
+
+        value.schema().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+/// Native scalar data or a reference to a transaction-owned capture.
+#[derive(Clone)]
+pub enum StoredValue {
+    Scalar(Scalar),
+    Collection(CapturedCollection),
+}
+
+impl From<Scalar> for StoredValue {
+    fn from(value: Scalar) -> Self {
+        Self::Scalar(value)
+    }
+}
+
+impl<'en> en::ToStream<'en> for StoredValue {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            Self::Scalar(value) => ("scalar", value).into_stream(encoder),
+            Self::Collection(value) => ("collection", value).into_stream(encoder),
+        }
+    }
+}
+
+impl<'en> en::IntoStream<'en> for StoredValue {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            Self::Scalar(value) => ("scalar", value).into_stream(encoder),
+            Self::Collection(value) => ("collection", value).into_stream(encoder),
+        }
+    }
+}
+
+impl de::FromStream for StoredValue {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl de::Visitor for Visitor {
+            type Value = StoredValue;
+
+            fn expecting() -> &'static str {
+                "a tagged stored value"
+            }
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let tag: String = required(&mut seq).await?;
+                let value = match tag.as_str() {
+                    "scalar" => StoredValue::Scalar(required(&mut seq).await?),
+                    "collection" => StoredValue::Collection(required(&mut seq).await?),
+                    _ => return Err(de::Error::custom("invalid stored value tag")),
+                };
+
+                end(&mut seq).await?;
+                Ok(value)
+            }
+        }
+
+        decoder.decode_seq(Visitor).await
+    }
+}
+
+async fn required<T: de::FromStream<Context = ()>, A: de::SeqAccess>(
+    seq: &mut A,
+) -> Result<T, A::Error> {
+    seq.next_element(())
+        .await?
+        .ok_or_else(|| de::Error::custom("missing Chain record field"))
+}
+
+async fn end<A: de::SeqAccess>(seq: &mut A) -> Result<(), A::Error> {
+    if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+        return Err(de::Error::custom("unexpected Chain record field"));
+    }
+
+    Ok(())
 }
 
 /// A persisted request, never a second invocation interface.
 #[derive(Clone)]
 pub enum MutationRecord {
-    Restore(Scalar),
-    Put(PathBuf, Scalar, Scalar),
+    Restore(CapturedCollection),
+    // Keep PUT payloads out of every retained record's inline allocation.
+    Put(PathBuf, Scalar, Box<StoredValue>),
     Delete(PathBuf, Scalar),
 }
 
-impl MutationRecord {
-    pub fn value(&self) -> Option<&Scalar> {
+impl<'en> en::ToStream<'en> for MutationRecord {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Self::Put(_, _, value) | Self::Restore(value) => Some(value),
-            Self::Delete(..) => None,
+            Self::Restore(value) => ("restore", value).into_stream(encoder),
+            Self::Put(path, key, value) => ("put", path, key, value).into_stream(encoder),
+            Self::Delete(path, key) => ("delete", path, key).into_stream(encoder),
         }
     }
 }
@@ -68,19 +212,9 @@ impl MutationRecord {
 impl<'en> en::IntoStream<'en> for MutationRecord {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
-            Self::Restore(value) => (value,).into_stream(encoder),
-            Self::Put(path, key, value) => (path, key, value).into_stream(encoder),
-            Self::Delete(path, key) => (path, key).into_stream(encoder),
-        }
-    }
-}
-
-impl<'en> en::ToStream<'en> for MutationRecord {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        match self {
-            Self::Restore(value) => (value,).into_stream(encoder),
-            Self::Put(path, key, value) => (path, key, value).into_stream(encoder),
-            Self::Delete(path, key) => (path, key).into_stream(encoder),
+            Self::Restore(value) => ("restore", value).into_stream(encoder),
+            Self::Put(path, key, value) => ("put", path, key, value).into_stream(encoder),
+            Self::Delete(path, key) => ("delete", path, key).into_stream(encoder),
         }
     }
 }
@@ -95,39 +229,28 @@ impl de::FromStream for MutationRecord {
             type Value = MutationRecord;
 
             fn expecting() -> &'static str {
-                "a restoration (collection,), DELETE (path, key), or PUT (path, key, value)"
+                "a tagged Chain mutation"
             }
 
             async fn visit_seq<A: de::SeqAccess>(
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let first: Scalar = seq
-                    .next_element(())
-                    .await?
-                    .ok_or_else(|| de::Error::invalid_length(0, Self::expecting()))?;
-                let Some(key) = seq.next_element(()).await? else {
-                    if reference(&first).map_err(de::Error::custom)?.is_none() {
-                        return Err(de::Error::custom(
-                            "restoration requires a stored collection reference",
-                        ));
+                let tag: String = required(&mut seq).await?;
+                let record = match tag.as_str() {
+                    "restore" => MutationRecord::Restore(required(&mut seq).await?),
+                    "put" => MutationRecord::Put(
+                        required(&mut seq).await?,
+                        required(&mut seq).await?,
+                        Box::new(required(&mut seq).await?),
+                    ),
+                    "delete" => {
+                        MutationRecord::Delete(required(&mut seq).await?, required(&mut seq).await?)
                     }
-                    return Ok(MutationRecord::Restore(first));
-                };
-                let path = match first {
-                    Scalar::Value(Value::String(path)) => {
-                        path.as_str().parse().map_err(de::Error::custom)?
-                    }
-                    _ => return Err(de::Error::custom("invalid mutation path")),
+                    _ => return Err(de::Error::custom("invalid Chain mutation tag")),
                 };
 
-                let record = match seq.next_element(()).await? {
-                    Some(value) => MutationRecord::Put(path, key, value),
-                    None => return Ok(MutationRecord::Delete(path, key)),
-                };
-                if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
-                    return Err(de::Error::invalid_length(4, Self::expecting()));
-                }
+                end(&mut seq).await?;
                 Ok(record)
             }
         }
@@ -136,266 +259,131 @@ impl de::FromStream for MutationRecord {
     }
 }
 
-/// Shared semantic history; file checksums are separate from predecessor linkage.
+/// The frontier is replaced atomically; transaction files are immutable.
 #[derive(Clone)]
-pub(crate) struct ChainBlock {
-    pub previous_hash: Sha256Hash,
-    pub mutations: BTreeMap<TxnId, Vec<MutationRecord>>,
-}
-
-impl<'en> en::IntoStream<'en> for ChainBlock {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        (
-            bytes::Bytes::copy_from_slice(&self.previous_hash),
-            en::MapStream::from(futures::stream::iter(self.mutations)),
-        )
-            .into_stream(encoder)
-    }
-}
-
-impl<'en> en::ToStream<'en> for ChainBlock {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        (
-            bytes::Bytes::copy_from_slice(&self.previous_hash),
-            en::MapStream::from(futures::stream::iter(&self.mutations)),
-        )
-            .into_stream(encoder)
-    }
-}
-
-impl de::FromStream for ChainBlock {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-        struct Mutations(BTreeMap<TxnId, Vec<MutationRecord>>);
-
-        impl de::FromStream for Mutations {
-            type Context = ();
-
-            async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
-                struct Visitor;
-
-                impl de::Visitor for Visitor {
-                    type Value = Mutations;
-
-                    fn expecting() -> &'static str {
-                        "mutations keyed by original transaction ID"
-                    }
-
-                    async fn visit_map<A: de::MapAccess>(
-                        self,
-                        mut map: A,
-                    ) -> Result<Self::Value, A::Error> {
-                        let mut mutations = BTreeMap::new();
-                        while let Some(id) = map.next_key::<TxnId>(()).await? {
-                            if mutations.insert(id, map.next_value(()).await?).is_some() {
-                                return Err(de::Error::custom("duplicate block transaction ID"));
-                            }
-                        }
-                        Ok(Mutations(mutations))
-                    }
-                }
-
-                decoder.decode_map(Visitor).await
-            }
-        }
-
-        let (previous_hash, Mutations(mutations)) =
-            <(bytes::Bytes, Mutations)>::from_stream((), decoder).await?;
-        let previous_hash = <[u8; 32]>::try_from(previous_hash.as_ref())
-            .map_err(|_| de::Error::custom("invalid predecessor hash length"))?;
-
-        Ok(Self {
-            previous_hash: previous_hash.into(),
-            mutations,
-        })
-    }
-}
-
-pub(crate) struct Store<Txn: StorageContext, FE = ChainFile> {
-    pub committed: FileLock<FE>,
-    pub values: DirLock<Txn::File>,
-}
-
-impl<Txn: StorageContext + 'static, FE> Store<Txn, FE> {
-    pub async fn capture<S>(&self, txn: &Txn, value: S) -> TCResult<Scalar>
-    where
-        S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
-    {
-        let value = if value.can_cast_into() {
-            self.capture_collection(txn, value.opt_cast_into().expect("collection value"))
-                .await?
-        } else {
-            value.into_scalar()?
-        };
-
-        // Verify reused storage and that a new native copy preserves the identity.
-        if matches!(&value, Scalar::Ref(_)) {
-            self.resolve_collection(txn.id(), value.clone()).await?;
-        }
-        Ok(value)
-    }
-
-    pub async fn capture_collection(&self, txn: &Txn, source: Collection<Txn>) -> TCResult<Scalar> {
-        let name = identity(&source, txn.id()).await?;
-        let (path, schema): (PathBuf, Value) = source.schema()?.into();
-        let value = Scalar::from(TCRef::Op(OpRef::Get((
-            Subject::Ref(IdRef::new(name.clone()), path),
-            schema.into(),
-        ))));
-
-        let target = {
-            let mut values = self.values.write().await;
-            if values.contains(name.as_str()) {
-                None
-            } else {
-                Some(values.create_dir(name.to_string())?)
-            }
-        };
-        if let Some(dir) = target {
-            source.copy_into(txn, dir).await?;
-        }
-        Ok(value)
-    }
-
-    pub async fn resolve<S>(&self, id: TxnId, value: Scalar) -> TCResult<S>
-    where
-        S: From<Scalar> + From<Collection<Txn>>,
-    {
-        if reference(&value)?.is_some() {
-            self.resolve_collection(id, value).await.map(S::from)
-        } else {
-            Ok(S::from(value))
-        }
-    }
-
-    pub async fn resolve_collection(&self, id: TxnId, value: Scalar) -> TCResult<Collection<Txn>> {
-        let (name, path, schema) = reference(&value)?
-            .ok_or_else(|| TCError::bad_request("expected stored collection reference"))?;
-        let schema = Value::try_cast_from(schema.clone(), |_| {
-            TCError::bad_request("invalid collection schema")
-        })?;
-        let schema = CollectionSchema::try_cast_from((path.clone(), schema), |_| {
-            TCError::bad_request("invalid collection schema")
-        })?;
-        let dir = self
-            .values
-            .read()
-            .await
-            .get_dir(name.as_str())
-            .cloned()
-            .ok_or_else(|| TCError::bad_request("missing stored collection"))?;
-        let collection = Collection::<Txn>::load(dir, schema).await?;
-        if identity(&collection, id).await? != *name {
-            return Err(TCError::bad_request("stored collection checksum mismatch"));
-        }
-        Ok(collection)
-    }
-
-    pub async fn sync(&self, records: &[MutationRecord]) -> TCResult<()> {
-        for name in references(records.iter())? {
-            let dir = self
-                .values
-                .read()
-                .await
-                .get_dir(&name)
-                .cloned()
-                .ok_or_else(|| TCError::bad_request("missing stored collection"))?;
-            dir.sync_all().await?;
-        }
-        Ok(())
-    }
-}
-
-impl<Txn: StorageContext + 'static, FE: ChainFileType> Store<Txn, FE> {
-    /// Reclaim orphans after recovery, before exposing the loaded Chain to requests.
-    pub(super) async fn reclaim(&self) -> TCResult<()> {
-        let retained = {
-            let committed = self.committed.read::<ChainFile>().await?;
-            references(committed.block.mutations.values().flatten())?
-        };
-        let names = self
-            .values
-            .read()
-            .await
-            .names()
-            .filter(|name| !retained.contains(*name))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for name in &names {
-            self.values.write().await.delete(name).await;
-        }
-
-        if !names.is_empty() {
-            self.values.sync_deleted().await?;
-        }
-        Ok(())
-    }
-}
-
-/// A delegated file composition containing Chain's semantic WAL record.
-pub trait ChainFileType:
-    Clone + FileLoad + FileSave + AsType<ChainFile> + From<ChainFile> + Send + Sync + 'static
-{
-}
-
-impl<T> ChainFileType for T where
-    T: Clone + FileLoad + FileSave + AsType<ChainFile> + From<ChainFile> + Send + Sync + 'static
-{
-}
-
-impl get_size::GetSize for MutationRecord {
-    fn get_size(&self) -> usize {
-        match self {
-            Self::Restore(value) => value.get_size(),
-            Self::Put(path, key, value) => path.get_size() + key.get_size() + value.get_size(),
-            Self::Delete(path, key) => path.get_size() + key.get_size(),
-        }
-    }
-}
-
-/// Filesystem encoding and checksum boundary for the committed semantic block.
-#[derive(Clone)]
-pub struct ChainFile {
-    pub(crate) finalized: Option<TxnId>,
-    pub(crate) materializing: Option<TxnId>,
-    pub(crate) block: ChainBlock,
-}
-
-impl get_size::GetSize for ChainFile {
-    fn get_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self
-                .block
-                .mutations
-                .values()
-                .map(|records| {
-                    records
-                        .iter()
-                        .map(get_size::GetSize::get_size)
-                        .sum::<usize>()
-                })
-                .sum::<usize>()
-    }
+pub enum ChainFile {
+    Frontier {
+        finalized: Option<TxnId>,
+    },
+    Transaction {
+        id: TxnId,
+        records: Arc<Vec<MutationRecord>>,
+    },
 }
 
 impl Default for ChainFile {
     fn default() -> Self {
-        Self {
-            finalized: None,
-            materializing: None,
-            block: ChainBlock {
-                previous_hash: Sha256Hash::default(),
-                mutations: BTreeMap::new(),
-            },
+        Self::Frontier { finalized: None }
+    }
+}
+
+impl ChainFile {
+    pub(crate) fn frontier(&self) -> TCResult<Option<TxnId>> {
+        match self {
+            Self::Frontier { finalized } => Ok(*finalized),
+            _ => Err(TCError::bad_request("expected Chain frontier file")),
+        }
+    }
+
+    pub(crate) fn records(&self, expected: TxnId) -> TCResult<&Arc<Vec<MutationRecord>>> {
+        match self {
+            Self::Transaction { id, records } if *id == expected && !records.is_empty() => {
+                Ok(records)
+            }
+            _ => Err(TCError::bad_request("invalid Chain transaction file")),
         }
     }
 }
 
 impl<'en> en::ToStream<'en> for ChainFile {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        (self.finalized, self.materializing, &self.block).into_stream(encoder)
+        match self {
+            Self::Frontier { finalized } => ("frontier", finalized).into_stream(encoder),
+            Self::Transaction { id, records } => ("transaction", id, records).into_stream(encoder),
+        }
+    }
+}
+
+impl de::FromStream for ChainFile {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl de::Visitor for Visitor {
+            type Value = ChainFile;
+
+            fn expecting() -> &'static str {
+                "a tagged Chain file"
+            }
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let tag: String = required(&mut seq).await?;
+                let value = match tag.as_str() {
+                    "frontier" => ChainFile::Frontier {
+                        finalized: required(&mut seq).await?,
+                    },
+                    "transaction" => ChainFile::Transaction {
+                        id: required(&mut seq).await?,
+                        records: Arc::new(required(&mut seq).await?),
+                    },
+                    _ => return Err(de::Error::custom("unsupported Chain file format")),
+                };
+
+                end(&mut seq).await?;
+                match &value {
+                    ChainFile::Frontier { .. } => {
+                        value.frontier().map_err(de::Error::custom)?;
+                    }
+                    ChainFile::Transaction { id, .. } => {
+                        value.records(*id).map_err(de::Error::custom)?;
+                    }
+                }
+
+                Ok(value)
+            }
+        }
+
+        decoder.decode_seq(Visitor).await
+    }
+}
+
+impl get_size::GetSize for CapturedCollection {
+    fn get_heap_size(&self) -> usize {
+        self.id.get_heap_size() + self.class.get_heap_size() + self.schema.get_heap_size()
+    }
+}
+
+impl get_size::GetSize for StoredValue {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Scalar(value) => value.get_heap_size(),
+            Self::Collection(value) => value.get_heap_size(),
+        }
+    }
+}
+
+impl get_size::GetSize for MutationRecord {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Restore(value) => value.get_heap_size(),
+            Self::Put(path, key, value) => {
+                path.get_heap_size() + key.get_heap_size() + value.get_heap_size()
+            }
+            Self::Delete(path, key) => path.get_heap_size() + key.get_heap_size(),
+        }
+    }
+}
+
+impl get_size::GetSize for ChainFile {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Frontier { .. } => 0,
+            Self::Transaction { records, .. } => records.get_heap_size(),
+        }
     }
 }
 
@@ -413,29 +401,54 @@ impl AsType<ChainFile> for ChainFile {
     }
 }
 
+/// A delegated file composition containing Chain's semantic history.
+/// Conversion retains the native ChainFile with a fixed composition envelope;
+/// GetSize accounts that envelope plus the contained ChainFile's heap footprint.
+pub trait ChainFileType:
+    Clone + FileLoad + FileSave + AsType<ChainFile> + From<ChainFile> + Send + Sync + 'static
+{
+}
+
+impl<T> ChainFileType for T where
+    T: Clone + FileLoad + FileSave + AsType<ChainFile> + From<ChainFile> + Send + Sync + 'static
+{
+}
+
 impl FileLoad for ChainFile {
-    async fn load(_: &Path, mut file: tokio::fs::File, _: std::fs::Metadata) -> io::Result<Self> {
+    async fn load(
+        path: &Path,
+        mut file: tokio::fs::File,
+        _: std::fs::Metadata,
+    ) -> io::Result<Self> {
         let mut expected = [0; 32];
         file.read_exact(&mut expected).await?;
-
         let mut hash = Sha256::new();
-        let value = {
+        let value: Self = {
             let stream = ReaderStream::new(file).inspect_ok(|bytes| hash.update(bytes));
             futures::pin_mut!(stream);
-            let (finalized, materializing, block) = destream_json::try_decode((), &mut stream)
+            let value = destream_json::try_decode((), &mut stream)
                 .await
                 .map_err(invalid)?;
-            let value = Self {
-                finalized,
-                materializing,
-                block,
-            };
+
             while stream.try_next().await?.is_some() {}
             value
         };
 
         if hash.finalize().as_slice() != expected {
             return Err(invalid("WAL file checksum mismatch"));
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("invalid Chain filename"))?;
+
+        if name == COMMITTED {
+            value.frontier().map_err(invalid)?;
+        } else {
+            value
+                .records(transaction_id(name).map_err(invalid)?)
+                .map_err(invalid)?;
         }
 
         Ok(value)
@@ -445,9 +458,8 @@ impl FileLoad for ChainFile {
 impl FileSave for ChainFile {
     async fn save(&self, file: &mut tokio::fs::File) -> io::Result<u64> {
         let mut hash = Sha256::new();
-        let mut stream = self.encoded()?;
+        let mut stream = destream_json::encode(self).map_err(invalid)?;
         let mut size = 32_u64;
-
         {
             let mut writer = tokio::io::BufWriter::new(&mut *file);
             writer.write_all(&[0; 32]).await?;
@@ -460,69 +472,271 @@ impl FileSave for ChainFile {
             }
             writer.flush().await?;
         }
-
         file.seek(io::SeekFrom::Start(0)).await?;
         file.write_all(&hash.finalize()).await?;
         Ok(size)
     }
 }
 
-impl ChainFile {
-    fn encoded(&self) -> io::Result<futures::stream::BoxStream<'_, io::Result<bytes::Bytes>>> {
-        Ok(destream_json::encode(self)
-            .map_err(invalid)?
-            .map_err(invalid)
-            .boxed())
-    }
+pub(crate) struct Store<Txn: StorageContext, FE = ChainFile> {
+    pub root: DirLock<FE>,
+    pub values: DirLock<Txn::File>,
+}
 
-    // Measure at the persistence boundary before cache and disk admission.
-    async fn size(&self) -> TCResult<usize> {
-        let mut stream = self.encoded()?;
-        let mut size = 32_usize;
-        while let Some(bytes) = stream.try_next().await.map_err(TCError::internal)? {
-            size = size
-                .checked_add(bytes.len())
-                .ok_or_else(|| TCError::bad_request("WAL file size overflow"))?;
+impl<Txn: StorageContext + 'static, FE: Send + Sync> Store<Txn, FE> {
+    pub async fn capture<S>(&self, txn: &Txn, value: S) -> TCResult<(StoredValue, S)>
+    where
+        S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
+    {
+        if value.can_cast_into() {
+            let (stored, accepted) = self
+                .capture_collection(txn, value.opt_cast_into().expect("collection value"))
+                .await?;
+
+            Ok((StoredValue::Collection(stored), S::from(accepted)))
+        } else {
+            let scalar = value.into_scalar()?;
+            let accepted = S::from(scalar.clone());
+            Ok((StoredValue::Scalar(scalar), accepted))
         }
-        Ok(size)
+    }
+
+    pub async fn capture_collection(
+        &self,
+        txn: &Txn,
+        source: Collection<Txn>,
+    ) -> TCResult<(CapturedCollection, Collection<Txn>)> {
+        let transaction = self
+            .values
+            .write()
+            .await
+            .get_or_create_dir(txn.id().to_string())?;
+
+        let (id, dir) = transaction.write().await.create_dir_unique()?;
+        let accepted = Collection::copy_from(txn, dir, &source).await?;
+        let hash = accepted.hash_native_capture(txn.id()).await?;
+        let (class, schema) = accepted.schema()?.into();
+        Ok((
+            CapturedCollection {
+                id: id.to_string().parse().expect("UUID is a valid capture Id"),
+                class,
+                schema,
+                hash,
+            },
+            accepted,
+        ))
+    }
+
+    pub async fn resolve<S: From<Scalar> + From<Collection<Txn>>>(
+        &self,
+        id: TxnId,
+        value: StoredValue,
+    ) -> TCResult<S> {
+        match value {
+            StoredValue::Scalar(value) => Ok(S::from(value)),
+            StoredValue::Collection(value) => {
+                self.resolve_collection(id, &value).await.map(S::from)
+            }
+        }
+    }
+
+    pub async fn resolve_collection(
+        &self,
+        id: TxnId,
+        value: &CapturedCollection,
+    ) -> TCResult<Collection<Txn>> {
+        let transaction = self
+            .values
+            .read()
+            .await
+            .get_dir(&id.to_string())
+            .cloned()
+            .ok_or_else(|| TCError::bad_request("missing capture transaction"))?;
+
+        let dir = transaction
+            .read()
+            .await
+            .get_dir(value.id.as_str())
+            .cloned()
+            .ok_or_else(|| TCError::bad_request("missing stored collection"))?;
+
+        let collection = Collection::<Txn>::load(dir, value.schema()?).await?;
+        if collection.hash_native_capture(id).await? != value.hash {
+            return Err(TCError::bad_request("stored collection checksum mismatch"));
+        }
+
+        Ok(collection)
+    }
+
+    pub async fn sync_captures(&self, records: &[MutationRecord]) -> TCResult<()> {
+        // CopyFrom completed each capture's data and immediate parent barriers.
+        // Publish the enclosing transaction directory only when captures exist.
+        if records.iter().any(|record| match record {
+            MutationRecord::Restore(_) => true,
+            MutationRecord::Put(_, _, value) => {
+                matches!(value.as_ref(), StoredValue::Collection(_))
+            }
+            MutationRecord::Delete(_, _) => false,
+        }) {
+            self.values.sync_deleted().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_captures(&self, id: TxnId) -> TCResult<()> {
+        self.values.write().await.delete(&id.to_string()).await;
+        self.values.sync_deleted().await?;
+        Ok(())
     }
 }
 
-pub(crate) async fn load<FE: Send + Sync>(root: &DirLock<FE>) -> TCResult<FileLock<FE>> {
-    root.read()
+impl<Txn: StorageContext + 'static, FE: ChainFileType> Store<Txn, FE> {
+    async fn frontier_file(&self) -> TCResult<FileLock<FE>> {
+        self.root
+            .read()
+            .await
+            .get_file(COMMITTED)
+            .cloned()
+            .ok_or_else(|| TCError::bad_request("missing Chain frontier file"))
+    }
+
+    pub async fn frontier(&self) -> TCResult<Option<TxnId>> {
+        self.frontier_file()
+            .await?
+            .read::<ChainFile>()
+            .await?
+            .frontier()
+    }
+
+    // This index contains delegated handles, never history payloads. The caller's
+    // finite admitted transaction set bounds live files; expiry advances the cutoff.
+    pub async fn transactions(&self) -> TCResult<BTreeMap<TxnId, FileLock<FE>>> {
+        let root = self.root.read().await;
+        transaction_files(&root)
+            .map(|entry| entry.map(|(id, file)| (id, file.clone())))
+            .collect()
+    }
+
+    /// Finalization needs only covered identities, not a sorted index of later files.
+    pub async fn transactions_through(&self, cutoff: TxnId) -> TCResult<Vec<TxnId>> {
+        let root = self.root.read().await;
+        transaction_files(&root)
+            .filter_map(|entry| match entry {
+                Ok((id, _)) if id <= cutoff => Some(Ok(id)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    pub async fn publish_transaction(
+        &self,
+        id: TxnId,
+        records: Vec<MutationRecord>,
+    ) -> TCResult<()> {
+        let file = self
+            .root
+            .write()
+            .await
+            .create_file::<FE>(
+                transaction_name(id),
+                FE::from(ChainFile::Transaction {
+                    id,
+                    records: Arc::new(records),
+                }),
+            )
+            .await?;
+
+        file.sync_all().await?;
+        Ok(())
+    }
+
+    pub async fn publish_frontier(&self, finalized: Option<TxnId>) -> TCResult<()> {
+        self.frontier_file()
+            .await?
+            .replace_all(FE::from(ChainFile::Frontier { finalized }))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn remove_history(&self, transactions: impl Iterator<Item = TxnId>) -> TCResult<()> {
+        for id in transactions {
+            self.root.write().await.delete(&transaction_name(id)).await;
+        }
+
+        self.root.sync_deleted().await?;
+        Ok(())
+    }
+
+    pub async fn clean_through(&self, cutoff: TxnId, transactions: &[TxnId]) -> TCResult<()> {
+        self.remove_history(transactions.iter().copied()).await?;
+        self.clean_captures(|id| id <= cutoff).await
+    }
+
+    async fn clean_captures(&self, remove: impl Fn(TxnId) -> bool) -> TCResult<()> {
+        // Walk a finite delegated file set one directory at a time, without a
+        // second reference graph or retaining native collection guards.
+        let mut after = None;
+        loop {
+            let next = {
+                let values = self.values.read().await;
+                let start = after.as_deref().map_or(Unbounded, Excluded);
+                values
+                    .range((start, Unbounded))
+                    .next()
+                    .map(|(name, _)| name.clone())
+            };
+
+            let Some(name) = next else {
+                break;
+            };
+
+            let id: TxnId = name.parse().map_err(TCError::bad_request)?;
+            if id.to_string() != name {
+                return Err(TCError::bad_request("invalid capture transaction name"));
+            }
+
+            if remove(id) {
+                self.values.write().await.delete(&name).await;
+            }
+
+            after = Some(name);
+        }
+
+        self.values.sync_deleted().await?;
+        Ok(())
+    }
+
+    pub async fn reclaim(
+        &self,
+        frontier: Option<TxnId>,
+        transactions: &BTreeMap<TxnId, FileLock<FE>>,
+    ) -> TCResult<()> {
+        if let Some(frontier) = frontier {
+            self.remove_history(transactions.range(..=frontier).map(|(&id, _)| id))
+                .await?;
+        }
+
+        self.clean_captures(|id| {
+            frontier.is_some_and(|frontier| id <= frontier) || !transactions.contains_key(&id)
+        })
         .await
-        .get_file(COMMITTED)
-        .cloned()
-        .ok_or_else(|| TCError::bad_request("missing committed SyncChain block"))
+    }
 }
 
-pub(crate) async fn create<FE: ChainFileType>(root: &DirLock<FE>) -> TCResult<FileLock<FE>> {
-    let value = ChainFile::default();
-    let size = value.size().await?;
-    let file = root
-        .write()
-        .await
-        .create_file(COMMITTED.into(), value, size)
-        .await?;
-    file.sync_all().await?;
-    Ok(file)
-}
+fn transaction_files<FE: Send + Sync>(
+    root: &Dir<FE>,
+) -> impl Iterator<Item = TCResult<(TxnId, &FileLock<FE>)>> {
+    root.iter()
+        .filter(|(name, _)| name.as_str() != COMMITTED)
+        .map(|(name, entry)| {
+            let id = transaction_id(name)?;
+            let file = entry
+                .as_file()
+                .ok_or_else(|| TCError::bad_request("expected Chain transaction file"))?;
 
-pub(crate) async fn publish<FE: ChainFileType>(
-    file: &FileLock<FE>,
-    value: ChainFile,
-) -> TCResult<()> {
-    let size = value.size().await?;
-    file.replace_all(FE::from(value), size).await?;
-    Ok(())
-}
-
-fn references<'a>(
-    records: impl Iterator<Item = &'a MutationRecord>,
-) -> TCResult<std::collections::BTreeSet<String>> {
-    records
-        .filter_map(MutationRecord::value)
-        .filter_map(|value| reference(value).transpose())
-        .map(|reference| reference.map(|(name, _, _)| name.to_string()))
-        .collect()
+            Ok((id, file))
+        })
 }

@@ -72,8 +72,8 @@ where
         Some(Box::new(move |txn, key, value| {
             Box::pin(async move {
                 chain
-                    .mutate(txn, path, key.clone(), Some(value.clone()), || {
-                        put(txn, key, value)
+                    .put_recorded(txn, path, key.clone(), value, |accepted| {
+                        put(txn, key, accepted)
                     })
                     .await
             })
@@ -90,7 +90,7 @@ where
         Some(Box::new(move |txn, key| {
             Box::pin(async move {
                 chain
-                    .mutate::<S, _, _>(txn, path, key.clone(), None, || delete(txn, key))
+                    .delete_recorded(txn, path, key.clone(), || delete(txn, key))
                     .await
             })
         }))

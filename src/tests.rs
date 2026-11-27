@@ -1,46 +1,31 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use freqfs::{Cache, DirLock};
-use tc_collection::{
-    Collection, PersistentFile, StorageContext,
-    btree::{BTree, BTreeColumnSchema, BTreeSchema, StorageConfig},
-    collection::BTreeView,
-    table::{Column, PersistentTable, TableSchema},
-};
+use tc_collection::btree::{BTreeColumnSchema, StorageConfig};
+use tc_collection::collection::CollectionSchema;
+use tc_collection::table::{Column, PersistentTable, TableSchema};
+use tc_collection::{Collection, CopyFrom, PersistentFile, StorageContext};
 use tc_error::TCResult;
-use tc_ir::{NetworkTime, Public, Transact, Transaction, TxnId};
+use tc_ir::{NetworkTime, Public, Scalar, Transact, Transaction, TxnId};
 use tc_state::State;
-use tc_value::Value;
+use tc_value::{NumberType, Value, ValueType};
 
-use crate::{ChainFile, SyncChain, TxnTaskQueue};
+use crate::{ChainFile, SyncChain};
+
+#[path = "../tests/unit/transaction_history.rs"]
+mod stack_tests;
 
 fn run<F: std::future::Future<Output = ()> + Send + 'static>(make: fn() -> F) {
-    use futures::FutureExt;
-    std::thread::Builder::new()
-        .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_stack_size(32 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .unwrap();
-            let (send, receive) = std::sync::mpsc::sync_channel(0);
-            runtime.spawn(async move {
-                let result = std::panic::AssertUnwindSafe(make()).catch_unwind().await;
-                send.send(result).unwrap();
-            });
-            if let Err(panic) = receive.recv().unwrap() {
-                std::panic::resume_unwind(panic);
-            }
-        })
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
         .unwrap()
-        .join()
-        .unwrap();
+        // Scenario futures retain several native operations. Keep one owning
+        // allocation rather than copying the whole scenario through block_on.
+        .block_on(Box::pin(make()));
 }
 
 #[derive(Clone)]
@@ -92,16 +77,53 @@ fn id(n: u16) -> TxnId {
 }
 
 async fn log_file(root: &DirLock<ChainFile>) -> freqfs::FileLock<ChainFile> {
-    crate::storage::load(root).await.unwrap()
+    root.read()
+        .await
+        .get_file(crate::storage::COMMITTED)
+        .cloned()
+        .unwrap()
 }
 
-async fn read_log(root: &DirLock<ChainFile>) -> TCResult<ChainFile> {
-    Ok(crate::storage::load(root).await?.read().await?.clone())
+// Aggregate snapshots are test assertions, never a production history index.
+struct History {
+    finalized: Option<TxnId>,
+    block: HistoryRecords,
 }
 
-async fn write_log(root: &DirLock<ChainFile>, value: ChainFile) {
-    let file = log_file(root).await;
-    crate::storage::publish(&file, value).await.unwrap();
+#[derive(Default)]
+struct HistoryRecords {
+    mutations: std::collections::BTreeMap<TxnId, Vec<crate::MutationRecord>>,
+}
+
+fn store(root: &DirLock<ChainFile>, values: DirLock<PersistentFile>) -> crate::storage::Store<Txn> {
+    crate::storage::Store {
+        root: root.clone(),
+        values,
+    }
+}
+
+async fn read_log(root: &DirLock<ChainFile>) -> TCResult<History> {
+    let finalized = log_file(root).await.read::<ChainFile>().await?.frontier()?;
+    let mut block = HistoryRecords::default();
+    let names: Vec<_> = root
+        .read()
+        .await
+        .names()
+        .filter(|n| n.as_str() != crate::storage::COMMITTED)
+        .cloned()
+        .collect();
+
+    for name in names {
+        let file = root.read().await.get_file(&name).cloned().unwrap();
+        let file = file.read::<ChainFile>().await?;
+        let ChainFile::Transaction { id, records } = &*file else {
+            panic!("transaction file")
+        };
+
+        block.mutations.insert(*id, records.as_ref().clone());
+    }
+
+    Ok(History { finalized, block })
 }
 
 async fn write_records(
@@ -109,23 +131,35 @@ async fn write_records(
     id: TxnId,
     records: Vec<crate::MutationRecord>,
 ) -> TCResult<()> {
-    let file = log_file(root).await;
-    let mut value = file.read().await?.clone();
-    value.block.mutations.insert(id, records);
-    crate::storage::publish(&file, value).await
+    let file = root
+        .write()
+        .await
+        .create_file(
+            crate::storage::transaction_name(id),
+            ChainFile::Transaction {
+                id,
+                records: records.into(),
+            },
+        )
+        .await?;
+
+    file.sync_all().await?;
+    Ok(())
 }
 
 async fn read_records(
     root: &DirLock<ChainFile>,
     id: TxnId,
 ) -> TCResult<Vec<crate::MutationRecord>> {
-    Ok(read_log(root).await?.block.mutations.remove(&id).unwrap())
-}
+    let file = root
+        .read()
+        .await
+        .get_file(&crate::storage::transaction_name(id))
+        .cloned()
+        .unwrap();
 
-async fn retain_records(root: &DirLock<ChainFile>, ids: &[TxnId]) {
-    let mut value = read_log(root).await.unwrap();
-    value.block.mutations.retain(|id, _| ids.contains(id));
-    write_log(root, value).await;
+    let records = file.read::<ChainFile>().await?.records(id)?.to_vec();
+    Ok(records)
 }
 
 struct Fixture {
@@ -197,48 +231,47 @@ impl Fixture {
         table: bool,
         load: bool,
     ) -> TCResult<Collection<Txn>> {
-        let dtype = Value::from(0_u64).class();
-        if table {
-            let schema = TableSchema::new(
-                vec![Column {
-                    name: "key".parse().unwrap(),
-                    dtype: dtype.clone(),
-                }],
-                vec![Column {
-                    name: "value".parse().unwrap(),
-                    dtype,
-                }],
-                vec![],
-                StorageConfig::default(),
+        // Lifecycle fixtures accept native and JSON-replayed numbers alike.
+        let dtype = ValueType::Number(NumberType::Number);
+        let schema = if table {
+            CollectionSchema::Table(
+                TableSchema::new(
+                    vec![Column {
+                        name: "key".parse().unwrap(),
+                        dtype: dtype.clone(),
+                    }],
+                    vec![Column {
+                        name: "value".parse().unwrap(),
+                        dtype,
+                    }],
+                    vec![],
+                    StorageConfig::default(),
+                )
+                .unwrap(),
             )
-            .unwrap();
-            Ok(if load {
-                PersistentTable::load(dir, schema).await?
-            } else {
-                PersistentTable::try_new(dir, schema)?
-            }
-            .into())
         } else {
-            let schema = BTreeSchema::new(StorageConfig::default(), 1, Some(vec![dtype.clone()]));
-            let btree = if load {
-                BTree::load(dir, schema).await?
-            } else {
-                BTree::try_with_schema(dir, schema)?
-            };
-            Ok(Collection::BTree(Box::new(BTreeView::new(
+            CollectionSchema::BTree(
                 vec![BTreeColumnSchema {
                     name: "key".into(),
                     dtype,
                     max_size: None,
-                }],
-                btree,
-            ))))
+                }]
+                .try_into()
+                .unwrap(),
+            )
+        };
+
+        if load {
+            Collection::load(dir, schema).await
+        } else {
+            Collection::create(dir, schema).await
         }
     }
 
     async fn canonical(&self, load: bool) -> TCResult<Collection<Txn>> {
         let dir = Cache::<PersistentFile>::new(32 * 1024 * 1024, None, 0, Duration::from_secs(3))
             .load(self.path.join("canonical"))?;
+
         Self::subject(dir, self.table.load(Ordering::Relaxed), load).await
     }
 
@@ -248,7 +281,7 @@ impl Fixture {
             self.canonical(false).await.unwrap(),
             self.log.clone(),
             self.values.clone(),
-            TxnTaskQueue::new(64),
+            64,
         )
         .await
         .unwrap()
@@ -259,7 +292,7 @@ impl Fixture {
             || self.canonical(true),
             Self::open_log(&self.path),
             Self::open_values(&self.path),
-            TxnTaskQueue::new(64),
+            64,
             |id| {
                 let mut txn = self.txn.clone();
                 txn.id = id;
@@ -276,6 +309,7 @@ async fn insert(chain: &SyncChain<Txn>, txn: &Txn, table: bool, n: u64) -> TCRes
     } else {
         Value::None
     };
+
     chain
         .put(
             txn,
@@ -286,14 +320,78 @@ async fn insert(chain: &SyncChain<Txn>, txn: &Txn, table: bool, n: u64) -> TCRes
         .await
 }
 
+#[tokio::test]
+#[ignore = "cutoff preparation measurements; run in release mode with --ignored --nocapture"]
+async fn cutoff_preparation_benchmark() {
+    for retained in [16_u16, 256, 4096] {
+        let f = Fixture::new();
+        for n in 0..retained {
+            let id = id(n + 2);
+            f.log
+                .write()
+                .await
+                .create_file(
+                    crate::storage::transaction_name(id),
+                    ChainFile::Transaction {
+                        id,
+                        records: vec![crate::MutationRecord::Delete(
+                            Default::default(),
+                            Default::default(),
+                        )]
+                        .into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let store = store(&f.log, f.values.clone());
+        let start = std::time::Instant::now();
+        for _ in 0..16 {
+            assert_eq!(
+                store.transactions().await.unwrap().len(),
+                usize::from(retained)
+            );
+        }
+
+        println!(
+            "PERSISTENCE_CUTOFF,{retained},full_index_16,ns,{}",
+            start.elapsed().as_nanos()
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..16 {
+            assert_eq!(
+                store.transactions_through(id(2)).await.unwrap(),
+                vec![id(2)]
+            );
+        }
+
+        println!(
+            "PERSISTENCE_CUTOFF,{retained},covered_16,ns,{}",
+            start.elapsed().as_nanos()
+        );
+    }
+}
+
 async fn count(chain: &SyncChain<Txn>, txn: &Txn) -> u64 {
     let state =
         Public::<State<Txn>>::get(chain, txn, &["count".parse().unwrap()], Value::None.into())
             .await
             .unwrap();
-    let State::Scalar(tc_ir::Scalar::Value(Value::Number(number))) = state else {
+
+    let State::Scalar(scalar) = state else {
         panic!("invalid count")
     };
+
+    let Scalar::Value(value) = scalar else {
+        panic!("invalid count")
+    };
+
+    let Value::Number(number) = value else {
+        panic!("invalid count")
+    };
+
     number.to_string().parse().unwrap()
 }
 
@@ -305,10 +403,11 @@ fn delegated_queue_admits_before_capture_and_recovery_ignores_pending_capacity()
             f.canonical(false).await.unwrap(),
             f.log.clone(),
             f.values.clone(),
-            TxnTaskQueue::new(2),
+            2,
         )
         .await
         .unwrap();
+
         insert(&chain, &f.txn(2), false, 1).await.unwrap();
         insert(&chain, &f.txn(2), false, 2).await.unwrap();
         let error = chain
@@ -320,21 +419,22 @@ fn delegated_queue_admits_before_capture_and_recovery_ignores_pending_capacity()
             )
             .await
             .unwrap_err();
+
         assert!(error.to_string().contains("capacity exhausted"));
         assert!(
             f.values.read().await.is_empty(),
             "admission precedes capture"
         );
+
         assert_eq!(count(&chain, &f.txn(2)).await, 2);
         chain.commit(id(2)).await.unwrap();
         drop(chain);
 
-        let queue = TxnTaskQueue::new(1);
         let reopened = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             Fixture::open_log(&f.path),
             Fixture::open_values(&f.path),
-            queue,
+            1,
             |original| {
                 assert_eq!(original, id(2));
                 let txn = f.txn(2);
@@ -343,6 +443,7 @@ fn delegated_queue_admits_before_capture_and_recovery_ignores_pending_capacity()
         )
         .await
         .unwrap();
+
         assert_eq!(count(&reopened, &f.txn(3)).await, 2);
         reopened.commit(id(2)).await.unwrap();
         insert(&reopened, &f.txn(3), false, 3).await.unwrap();
@@ -356,53 +457,45 @@ fn delegated_queue_admits_before_capture_and_recovery_ignores_pending_capacity()
 }
 
 #[test]
-fn constructors_require_fresh_queues_and_distinguish_creation_from_loading() {
+fn constructors_reject_zero_capacity_and_distinguish_creation_from_loading() {
     run(|| async {
-        for finalized in [false, true] {
-            let f = Fixture::new();
-            assert!(f.reopen().await.is_err());
-            let subject = f.canonical(false).await.unwrap();
-            let queue = TxnTaskQueue::new(1);
-            if finalized {
-                queue.operation().await.unwrap().finalize(id(1)).unwrap();
-            } else {
-                queue.register(id(1)).unwrap();
-            }
-            assert!(
-                SyncChain::create(
-                    subject.clone(),
-                    f.log.clone(),
-                    f.values.clone(),
-                    queue.clone()
-                )
+        let f = Fixture::new();
+        assert!(f.reopen().await.is_err());
+        let subject = f.canonical(false).await.unwrap();
+        assert!(
+            SyncChain::create(subject.clone(), f.log.clone(), f.values.clone(), 0)
                 .await
                 .is_err()
-            );
-            assert!(f.log.read().await.is_empty());
-            subject.sync_all().await.unwrap();
-            crate::storage::create(&f.log).await.unwrap();
-            assert!(
-                SyncChain::create(
-                    subject,
-                    f.log.clone(),
-                    f.values.clone(),
-                    TxnTaskQueue::new(64)
-                )
+        );
+
+        assert!(f.log.read().await.is_empty());
+        f.log
+            .write()
+            .await
+            .create_file(crate::storage::COMMITTED.into(), ChainFile::default())
+            .await
+            .unwrap()
+            .sync_all()
+            .await
+            .unwrap();
+
+        assert!(
+            SyncChain::create(subject, f.log.clone(), f.values.clone(), 64)
                 .await
                 .is_err()
-            );
-            assert!(
-                SyncChain::load::<State<_>, _, _, _, _>(
-                    || f.canonical(true),
-                    f.log.clone(),
-                    f.values.clone(),
-                    queue,
-                    |_| async { panic!("used queue must be rejected") }
-                )
-                .await
-                .is_err()
-            );
-        }
+        );
+
+        assert!(
+            SyncChain::load::<State<_>, _, _, _, _>(
+                || f.canonical(true),
+                f.log.clone(),
+                f.values.clone(),
+                0,
+                |_| async { panic!("zero capacity must be rejected") }
+            )
+            .await
+            .is_err()
+        );
     });
 }
 
@@ -447,13 +540,16 @@ fn missing_and_corrupt_committed_blocks_fail_closed() {
                     || f.canonical(true),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
-                    TxnTaskQueue::new(64),
+                    64,
                     |_| async { panic!("validate the entire WAL before requesting capabilities") }
                 )
                 .await
-                .is_err()
+                .err()
+                .unwrap()
+                .requires_recovery()
             );
         }
+
         std::fs::remove_file(&path).unwrap();
         assert!(f.reopen().await.is_err());
         std::fs::write(f.path.join("log/index.json"), original).unwrap();
@@ -476,20 +572,22 @@ fn recovery_rejects_replacement_transaction_ids() {
             vec![crate::MutationRecord::Put(
                 "/insert".parse().unwrap(),
                 Value::None.into(),
-                Value::Tuple(vec![Value::from(1_u64)]).into(),
+                Box::new(Scalar::from(Value::Tuple(vec![Value::from(1_u64)])).into()),
             )],
         )
         .await
         .unwrap();
+
         drop(chain);
         let result = SyncChain::load::<State<_>, _, _, _, _>(
             || f.canonical(true),
             Fixture::open_log(&f.path),
             Fixture::open_values(&f.path),
-            TxnTaskQueue::new(64),
+            64,
             |_| async { Ok(f.txn(9)) },
         )
         .await;
+
         assert!(result.is_err());
     });
 }
@@ -509,7 +607,7 @@ fn finalization_waits_serialize_newer_mutations_and_commits() {
                 }
 
                 let file = log_file(&f.log).await;
-                let guard = file.write().await.unwrap();
+                let guard = file.write::<ChainFile>().await.unwrap();
                 let cutoff = id(2);
                 let mut finalization = Box::pin(chain.finalize(&cutoff));
                 assert!(futures::poll!(&mut finalization).is_pending());
@@ -520,6 +618,7 @@ fn finalization_waits_serialize_newer_mutations_and_commits() {
                     }
                     chain.commit(txn.id()).await
                 });
+
                 assert!(futures::poll!(&mut request).is_pending());
                 drop(guard);
                 finalization.await.unwrap();
@@ -549,15 +648,13 @@ fn cancelled_commit_requires_reopening() {
             insert(&chain, &f.txn(3), table, 2).await.unwrap();
             let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
 
-            let file = log_file(&f.log).await;
-            let guard = file.write().await.unwrap();
+            let guard = f.log.write().await;
             let mut commit = Box::pin(chain.commit(id(3)));
             assert!(futures::poll!(&mut commit).is_pending());
             assert!(futures::poll!(Box::pin(chain.rollback(&id(3)))).is_pending());
             drop(commit);
             drop(guard);
 
-            assert!(chain.register(f.txn(4)).is_err());
             assert!(chain.hash(&f.txn(4)).await.is_err());
             assert!(chain.commit(id(3)).await.is_err());
             assert!(chain.rollback(&id(3)).await.is_err());
@@ -572,10 +669,12 @@ fn cancelled_commit_requires_reopening() {
                 .await
                 .is_err()
             );
+
             assert_eq!(
                 std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
                 publication
             );
+
             drop(chain);
             assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(4)).await, 1);
         }
@@ -591,30 +690,45 @@ fn stalled_handlers_do_not_exclude_earlier_decisions() {
                 let chain = f.chain(table).await;
                 insert(&chain, &f.txn(2), table, 1).await.unwrap();
                 let txn = f.txn(3);
-                // Stall the selected handler in its delegated workspace allocation.
-                // The WAL has already recorded the scalar request at this point.
-                let workspace = txn.root.write().await;
-                let mut mutation = Box::pin(insert(&chain, &txn, table, 2));
+                // Source I/O retains the task without retaining lifecycle exclusion.
+                let source_dir = f.working().await;
+                let source = Fixture::subject(source_dir.clone(), table, false)
+                    .await
+                    .unwrap();
+
+                let base = source_dir.read().await.get_dir("base").cloned().unwrap();
+                let native = if table {
+                    base.read().await.get_dir("primary").cloned().unwrap()
+                } else {
+                    base
+                };
+
+                let workspace = native.write().await;
+                let mut mutation = Box::pin(chain.restore_from(&txn, &source));
                 assert!(
                     tokio::time::timeout(Duration::from_millis(20), &mut mutation)
                         .await
                         .is_err(),
                     "the selected handler must wait, not encounter Chain-wide exclusion"
                 );
+
                 tokio::time::timeout(Duration::from_secs(1), chain.commit(id(2)))
                     .await
                     .unwrap()
                     .unwrap();
+
                 tokio::time::timeout(Duration::from_secs(1), chain.finalize(&id(2)))
                     .await
                     .unwrap()
                     .unwrap();
+
                 if complete {
                     drop(workspace);
                     tokio::time::timeout(Duration::from_secs(1), mutation)
                         .await
                         .unwrap()
                         .unwrap();
+
                     chain.commit(id(3)).await.unwrap();
                 } else {
                     drop(mutation);
@@ -622,7 +736,8 @@ fn stalled_handlers_do_not_exclude_earlier_decisions() {
                     assert!(chain.commit(id(3)).await.is_err());
                     chain.rollback(&id(3)).await.unwrap();
                 }
-                let expected = if complete { 2 } else { 1 };
+
+                let expected = if complete { 0 } else { 1 };
                 assert_eq!(count(&chain, &f.txn(4)).await, expected);
                 drop(chain);
                 assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(4)).await, expected);
@@ -634,34 +749,20 @@ fn stalled_handlers_do_not_exclude_earlier_decisions() {
 #[test]
 fn same_transaction_keeps_replay_order_and_cancellation_preserves_failure() {
     run(|| async {
-        for capture in [false, true] {
+        {
             let f = Fixture::new();
             let chain = f.chain(false).await;
             let txn = f.txn(2);
-            let value = if capture {
-                State::from(f.source(false).await)
-            } else {
-                State::from(Value::Tuple(vec![Value::from(1_u64)]))
-            };
-            // Block capture before recording, or workspace allocation in the selected handler.
-            let guard = if capture {
-                f.values.write().await
-            } else {
-                txn.root.write().await
-            };
+            let value = State::from(f.source(false).await);
+            let guard = f.values.write().await;
+
             let path = ["insert".parse().unwrap()];
             let mut first = Box::pin(chain.put(&txn, &path, Value::None.into(), value));
             assert!(futures::poll!(&mut first).is_pending());
             assert!(insert(&chain, &txn, false, 2).await.is_err());
-            if capture {
-                assert!(futures::poll!(Box::pin(chain.commit(txn.id()))).is_pending());
-                assert!(futures::poll!(Box::pin(chain.rollback(&txn.id()))).is_pending());
-                assert!(futures::poll!(Box::pin(chain.finalize(&txn.id()))).is_pending());
-            } else {
-                assert!(chain.commit(txn.id()).await.is_err());
-                assert!(chain.rollback(&txn.id()).await.is_err());
-                assert!(chain.finalize(&txn.id()).await.is_err());
-            }
+            assert!(chain.commit(txn.id()).await.is_err());
+            assert!(chain.rollback(&txn.id()).await.is_err());
+            assert!(chain.finalize(&txn.id()).await.is_err());
             drop(first);
             drop(guard);
 
@@ -676,6 +777,7 @@ fn same_transaction_keeps_replay_order_and_cancellation_preserves_failure() {
                 .await
                 .is_err()
             );
+
             chain.rollback(&txn.id()).await.unwrap();
             assert_eq!(count(&chain, &f.txn(3)).await, 0);
             drop(chain);
@@ -697,6 +799,7 @@ fn reads_wait_for_pending_commit_without_blocking_lifecycle() {
                 .await
                 .is_err()
         );
+
         chain.commit(id(2)).await.unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), read)
@@ -714,9 +817,9 @@ fn cutoff_preserves_future_commits_and_discards_pending() {
         let chain = f.chain(true).await;
         insert(&chain, &f.txn(2), true, 1).await.unwrap();
         chain.commit(id(2)).await.unwrap();
+        insert(&chain, &f.txn(3), true, 3).await.unwrap();
         insert(&chain, &f.txn(4), true, 2).await.unwrap();
         chain.commit(id(4)).await.unwrap();
-        insert(&chain, &f.txn(3), true, 3).await.unwrap();
         chain.finalize(&id(3)).await.unwrap();
         assert!(
             Public::<State<Txn>>::get(
@@ -728,6 +831,7 @@ fn cutoff_preserves_future_commits_and_discards_pending() {
             .await
             .is_err()
         );
+
         assert_eq!(count(&chain, &f.txn(5)).await, 2);
         drop(chain);
         assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(5)).await, 2);
@@ -739,13 +843,6 @@ fn scalar_writes_are_batched_and_read_only_commit_does_not_write_wal() {
     run(|| async {
         let f = Fixture::new();
         let chain = f.chain(true).await;
-        let owners = Arc::strong_count(&f.txn.next);
-        chain.register(f.txn(2)).unwrap();
-        assert_eq!(
-            Arc::strong_count(&f.txn.next),
-            owners,
-            "registration retains no capability"
-        );
         let initial = f.log.read().await.len();
         for key in 0..32 {
             insert(&chain, &f.txn(2), true, key).await.unwrap();
@@ -755,6 +852,7 @@ fn scalar_writes_are_batched_and_read_only_commit_does_not_write_wal() {
             initial,
             "scalar capture must not allocate WAL files"
         );
+
         chain.commit(id(2)).await.unwrap();
         let committed = read_log(&f.log).await.unwrap();
         assert_eq!(committed.block.mutations[&id(2)].len(), 32);
@@ -765,7 +863,8 @@ fn scalar_writes_are_batched_and_read_only_commit_does_not_write_wal() {
                 .get_file(crate::storage::COMMITTED)
                 .is_some()
         );
-        assert_eq!(f.log.read().await.len(), initial);
+
+        assert_eq!(f.log.read().await.len(), initial + 1);
         assert_eq!(count(&chain.clone(), &f.txn(3)).await, 32);
         let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
         chain.commit(id(3)).await.unwrap();
@@ -773,7 +872,8 @@ fn scalar_writes_are_batched_and_read_only_commit_does_not_write_wal() {
             std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
             publication
         );
-        assert_eq!(f.log.read().await.len(), initial);
+
+        assert_eq!(f.log.read().await.len(), initial + 1);
         drop(chain);
         assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(4)).await, 32);
     });
@@ -816,18 +916,69 @@ fn subject_hash_tracks_transactional_visibility_and_recovery() {
 }
 
 #[test]
+fn tied_native_keys_replay_and_finalize_without_changing_identity() {
+    run(|| async {
+        for table in [false, true] {
+            let f = Fixture::new();
+            let chain = f.chain(table).await;
+            let keys: Vec<Value> = ["4+3i", "3+4i"]
+                .into_iter()
+                .map(|number| Value::Number(number.parse().unwrap()))
+                .collect();
+
+            for (index, key) in keys.iter().enumerate() {
+                let txn = f.txn(index as u16 + 2);
+                chain
+                    .put(
+                        &txn,
+                        &["insert".parse().unwrap()],
+                        if table {
+                            Value::Tuple(vec![key.clone()]).into()
+                        } else {
+                            Value::None.into()
+                        },
+                        State::from(Value::Tuple(vec![if table {
+                            Value::from(0u64)
+                        } else {
+                            key.clone()
+                        }])),
+                    )
+                    .await
+                    .unwrap();
+
+                chain.commit(txn.id()).await.unwrap();
+            }
+
+            assert_eq!(count(&chain, &f.txn(4)).await, 2);
+            let hash = chain.hash(&f.txn(4)).await.unwrap();
+            drop(chain);
+            let chain = f.reopen().await.unwrap();
+            assert_eq!(count(&chain, &f.txn(4)).await, 2);
+            assert_eq!(chain.hash(&f.txn(4)).await.unwrap(), hash);
+            chain.finalize(&id(3)).await.unwrap();
+            assert_eq!(chain.hash(&f.txn(4)).await.unwrap(), hash);
+            drop(chain);
+            assert_eq!(
+                f.reopen().await.unwrap().hash(&f.txn(4)).await.unwrap(),
+                hash
+            );
+        }
+    });
+}
+
+#[test]
 fn observations_do_not_register_and_unseen_read_only_decisions_are_deterministic() {
     run(|| async {
         let f = Fixture::new();
-        let queue = TxnTaskQueue::new(64);
         let chain = SyncChain::create(
             f.canonical(false).await.unwrap(),
             f.log.clone(),
             f.values.clone(),
-            queue.clone(),
+            64,
         )
         .await
         .unwrap();
+
         for n in 2..20 {
             assert_eq!(count(&chain, &f.txn(n)).await, 0);
             chain.hash(&f.txn(n)).await.unwrap();
@@ -835,8 +986,8 @@ fn observations_do_not_register_and_unseen_read_only_decisions_are_deterministic
         let view = tc_ir::IntoView::into_view(chain.clone(), f.txn(20))
             .await
             .unwrap();
+
         drop(view);
-        queue.validate_fresh().unwrap();
         let path = f.path.join("log/committed.chain_block");
         let before = std::fs::read(&path).unwrap();
         chain.commit(id(21)).await.unwrap();
@@ -846,10 +997,10 @@ fn observations_do_not_register_and_unseen_read_only_decisions_are_deterministic
         chain.rollback(&id(22)).await.unwrap();
         assert!(chain.commit(id(22)).await.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(queue.readable(id(22)).is_err());
+        assert!(chain.hash(&f.txn(22)).await.is_err());
         chain.finalize(&id(22)).await.unwrap();
         assert_eq!(read_log(&f.log).await.unwrap().finalized, Some(id(22)));
-        assert!(queue.readable(id(21)).is_err());
+        assert!(chain.hash(&f.txn(21)).await.is_err());
         insert(&chain, &f.txn(23), false, 1).await.unwrap();
         chain.commit(id(23)).await.unwrap();
     });
@@ -870,588 +1021,27 @@ fn ordered_put_delete_batch_replays_exactly() {
         )
         .await
         .unwrap();
+
         insert(&chain, &txn, true, 1).await.unwrap();
-        chain.commit(id(2)).await.unwrap();
+        chain.publish_before_subject_commit(id(2)).await;
         drop(chain);
         assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(4)).await, 1);
     });
 }
 
 #[test]
-fn collection_identity_includes_semantic_schema_and_contents() {
-    run(|| async {
-        use safecast::TryCastFrom;
-        use tc_collection::collection::CollectionSchema;
-
-        let f = Fixture::new();
-        let txn = f.txn(2);
-        let btree = f.source(false).await;
-        let table = f.source(true).await;
-        assert_ne!(
-            btree.hash(txn.id()).await.unwrap(),
-            table.hash(txn.id()).await.unwrap()
-        );
-
-        for source in [&btree, &table] {
-            let schema: (pathlink::PathBuf, Value) = source.schema().unwrap().into();
-            let decoded = CollectionSchema::opt_cast_from(schema.clone()).unwrap();
-            assert_eq!(<(pathlink::PathBuf, Value)>::from(decoded), schema);
-            let copy = source.copy_into(&txn, f.working().await).await.unwrap();
-            assert_eq!(
-                source.hash(txn.id()).await.unwrap(),
-                copy.hash(txn.id()).await.unwrap()
-            );
-        }
-
-        let original = btree.hash(txn.id()).await.unwrap();
-        for property in 0..3 {
-            let mut changed = btree.clone();
-            let Collection::BTree(view) = &mut changed else {
-                unreachable!()
-            };
-            match property {
-                0 => view.schema[0].name = "renamed".into(),
-                1 => view.schema[0].max_size = Some(64_u64.into()),
-                _ => view.schema[0].dtype = Value::from("text").class(),
-            }
-            assert_ne!(changed.hash(txn.id()).await.unwrap(), original);
-        }
-        btree
-            .put(
-                &txn,
-                &["insert".parse().unwrap()],
-                Value::None.into(),
-                State::from(Value::Tuple(vec![Value::from(5_u64)])),
-            )
-            .await
-            .unwrap();
-        assert_ne!(btree.hash(txn.id()).await.unwrap(), original);
-
-        let mut hashes = Vec::new();
-        for (name, indices, storage) in [
-            ("key", vec![], StorageConfig::default()),
-            (
-                "key",
-                vec![],
-                StorageConfig {
-                    block_size: 8192,
-                    order: 32,
-                },
-            ),
-            ("renamed", vec![], StorageConfig::default()),
-            (
-                "key",
-                vec![("by_value".into(), vec!["value".parse().unwrap()])],
-                StorageConfig::default(),
-            ),
-        ] {
-            let schema = TableSchema::new(
-                vec![Column {
-                    name: name.parse().unwrap(),
-                    dtype: Value::from(0_u64).class(),
-                }],
-                vec![Column {
-                    name: "value".parse().unwrap(),
-                    dtype: Value::from(0_u64).class(),
-                }],
-                indices,
-                storage,
-            )
-            .unwrap();
-            let source = Collection::from(
-                PersistentTable::<Txn>::try_new(f.working().await, schema).unwrap(),
-            );
-            let copy = source.copy_into(&txn, f.working().await).await.unwrap();
-            let hash = source.hash(txn.id()).await.unwrap();
-            assert_eq!(hash, copy.hash(txn.id()).await.unwrap());
-            let native: (pathlink::PathBuf, Value) = source.schema().unwrap().into();
-            assert_eq!(
-                <(pathlink::PathBuf, Value)>::from(
-                    CollectionSchema::opt_cast_from(native.clone()).unwrap()
-                ),
-                native
-            );
-            hashes.push(hash);
-        }
-        assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-        assert_ne!(hashes[0], hashes[3]);
-
-        // Hashes are ordered, while native copying materializes canonical order.
-        // Never publish a reordered view under an identity its copy cannot reproduce.
-        btree
-            .put(
-                &txn,
-                &["insert".parse().unwrap()],
-                Value::None.into(),
-                State::from(Value::Tuple(vec![Value::from(6_u64)])),
-            )
-            .await
-            .unwrap();
-        let Collection::BTree(mut view) = btree else {
-            unreachable!()
-        };
-        view.reverse = true;
-        let store = crate::storage::Store {
-            committed: crate::storage::create(&f.log).await.unwrap(),
-            values: f.values.clone(),
-        };
-        assert!(
-            store
-                .capture::<State<_>>(&txn, Collection::BTree(view).into())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("checksum mismatch")
-        );
-        write_log(&f.log, ChainFile::default()).await;
-        store.reclaim().await.unwrap();
-        assert!(f.values.read().await.is_empty());
-    });
-}
-
-#[test]
-fn native_references_are_shared_and_corrupt_captures_are_not_replaced() {
-    run(|| async {
-        for table in [false, true] {
-            let f = Fixture::new();
-            let store = crate::storage::Store {
-                committed: crate::storage::create(&f.log).await.unwrap(),
-                values: f.values.clone(),
-            };
-            let source = f.source(table).await;
-            let first = store
-                .capture::<State<_>>(&f.txn(2), source.clone().into())
-                .await
-                .unwrap();
-            let second = store
-                .capture::<State<_>>(&f.txn(3), f.source(table).await.into())
-                .await
-                .unwrap();
-            assert_eq!(first, second);
-            assert_eq!(f.values.read().await.len(), 1);
-            let name = crate::storage::reference(&first)
-                .unwrap()
-                .unwrap()
-                .0
-                .to_string();
-            let records = vec![
-                crate::storage::MutationRecord::Put(
-                    pathlink::PathBuf::new(),
-                    tc_ir::Scalar::default(),
-                    first.clone()
-                );
-                2
-            ];
-            store.sync(&records).await.unwrap();
-            for n in [2, 3] {
-                write_records(&f.log, id(n), records.clone()).await.unwrap();
-            }
-            retain_records(&f.log, &[id(3)]).await;
-            store.reclaim().await.unwrap();
-            assert_eq!(f.values.read().await.len(), 1);
-            assert_eq!(read_records(&f.log, id(3)).await.unwrap().len(), 2);
-            let State::Collection(captured) =
-                store.resolve::<State<_>>(id(3), second).await.unwrap()
-            else {
-                panic!("expected captured collection");
-            };
-            captured
-                .put(
-                    &f.txn(4),
-                    &["insert".parse().unwrap()],
-                    if table {
-                        Value::Tuple(vec![Value::from(1_u64)])
-                    } else {
-                        Value::None
-                    }
-                    .into(),
-                    State::from(Value::Tuple(vec![Value::from(1_u64)])),
-                )
-                .await
-                .unwrap();
-            captured.commit(id(4)).await.unwrap();
-            captured.finalize(&id(4)).await.unwrap();
-            captured.sync_all().await.unwrap();
-            assert!(
-                store
-                    .capture::<State<_>>(&f.txn(5), source.clone().into())
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("checksum mismatch")
-            );
-            assert!(f.values.read().await.get_dir(&name).is_some());
-
-            write_log(&f.log, ChainFile::default()).await;
-            store.reclaim().await.unwrap();
-            assert!(f.values.read().await.is_empty());
-
-            // An interrupted capture may leave an empty directory. Never fill it in on reuse.
-            let incomplete = f.values.write().await.create_dir(name.clone()).unwrap();
-            assert!(
-                store
-                    .capture::<State<_>>(&f.txn(4), source.into())
-                    .await
-                    .is_err()
-            );
-            assert!(incomplete.read().await.is_empty());
-            assert!(f.values.read().await.get_dir(&name).is_some());
-            write_log(&f.log, ChainFile::default()).await;
-            store.reclaim().await.unwrap();
-            assert!(f.values.read().await.is_empty());
-        }
-    });
-}
-
-#[test]
-fn unsupported_collection_references_fail_before_replay() {
-    run(|| async {
-        use tc_ir::{IdRef, OpRef, Scalar, Subject, TCRef};
-        use tc_value::class::NativeClass;
-
-        let f = Fixture::new();
-        let _chain = f.chain(false).await;
-        let store = crate::storage::Store {
-            committed: log_file(&f.log).await,
-            values: f.values.clone(),
-        };
-        let value = store
-            .capture::<State<_>>(&f.txn(2), State::from(f.source(false).await))
-            .await
-            .unwrap();
-        let (name, path, schema) = crate::storage::reference(&value).unwrap().unwrap();
-        let get = |name: &str, path, schema| {
-            Scalar::from(TCRef::Op(OpRef::Get((
-                Subject::Ref(IdRef::new(name.parse().unwrap()), path),
-                schema,
-            ))))
-        };
-        let invalid = [
-            Scalar::from(TCRef::Id(IdRef::new("literal".parse().unwrap()))),
-            Scalar::from(TCRef::Op(OpRef::Get((
-                Subject::Link("/state/collection/btree".parse().unwrap()),
-                schema.clone(),
-            )))),
-            get("short", path.clone(), schema.clone()),
-            get(&"g".repeat(64), path.clone(), schema.clone()),
-            get(
-                name.as_str(),
-                tc_collection::TensorType.path(),
-                schema.clone(),
-            ),
-            get(name.as_str(), path.clone(), Scalar::default()),
-            get(&"0".repeat(64), path.clone(), schema.clone()),
-        ];
-        for value in invalid {
-            assert!(
-                store
-                    .capture::<State<_>>(&f.txn(2), value.clone().into())
-                    .await
-                    .is_err()
-            );
-            assert!(
-                store
-                    .resolve::<State<_>>(id(2), value.clone())
-                    .await
-                    .is_err()
-            );
-        }
-        let records = vec![
-            crate::storage::MutationRecord::Put(
-                "/insert".parse().unwrap(),
-                Scalar::default(),
-                value.clone()
-            );
-            2
-        ];
-        store.sync(&records).await.unwrap();
-        write_records(&f.log, id(2), records).await.unwrap();
-        write_records(
-            &f.log,
-            id(3),
-            vec![crate::storage::MutationRecord::Put(
-                "/insert".parse().unwrap(),
-                Scalar::default(),
-                value.clone(),
-            )],
-        )
-        .await
-        .unwrap();
-        retain_records(&f.log, &[id(2), id(3)]).await;
-        let recovered = SyncChain::load::<State<_>, _, _, _, _>(
-            || f.canonical(true),
-            Fixture::open_log(&f.path),
-            Fixture::open_values(&f.path),
-            TxnTaskQueue::new(64),
-            |original| async move {
-                assert_eq!(original, id(2));
-                Err(tc_error::TCError::internal("shared references validated"))
-            },
-        )
-        .await;
-        assert!(
-            recovered
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("shared references validated")
-        );
-
-        // Replace the later transaction with a malformed reference. Validation must finish
-        // across all transactions before any capability is requested.
-        write_records(
-            &f.log,
-            id(3),
-            vec![crate::storage::MutationRecord::Put(
-                "/insert".parse().unwrap(),
-                Scalar::default(),
-                get(name.as_str(), path.clone(), Scalar::default()),
-            )],
-        )
-        .await
-        .unwrap();
-        retain_records(&f.log, &[id(2), id(3)]).await;
-        assert!(
-            SyncChain::load::<State<_>, _, _, _, _>(
-                || f.canonical(true),
-                Fixture::open_log(&f.path),
-                Fixture::open_values(&f.path),
-                TxnTaskQueue::new(64),
-                |_| async {
-                    panic!("all references must be validated before requesting capabilities")
-                }
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(f.log.read().await.len(), 1);
-    });
-}
-
-#[test]
-fn native_collection_values_are_copied_and_verified() {
-    run(|| async {
-        for table in [false, true] {
-            let f = Fixture::new();
-            let source = f.source(table).await;
-            let txn = f.txn(2);
-            source
-                .put(
-                    &txn,
-                    &["insert".parse().unwrap()],
-                    if table {
-                        Value::Tuple(vec![Value::from(9_u64)])
-                    } else {
-                        Value::None
-                    }
-                    .into(),
-                    State::from(Value::Tuple(vec![Value::from(9_u64)])),
-                )
-                .await
-                .unwrap();
-            let store = crate::storage::Store {
-                committed: crate::storage::create(&f.log).await.unwrap(),
-                values: f.values.clone(),
-            };
-            let value = store
-                .capture::<State<_>>(&txn, State::from(source.clone()))
-                .await
-                .unwrap();
-            assert_eq!(
-                store
-                    .capture::<State<_>>(&txn, source.clone().into())
-                    .await
-                    .unwrap(),
-                value
-            );
-            assert_eq!(f.values.read().await.len(), 1);
-
-            source.rollback(&txn.id()).await.unwrap();
-            let records = vec![crate::storage::MutationRecord::Put(
-                pathlink::PathBuf::new(),
-                tc_ir::Scalar::default(),
-                value.clone(),
-            )];
-            store.sync(&records).await.unwrap();
-            write_records(&f.log, txn.id(), records).await.unwrap();
-            let mut records = read_records(&Fixture::open_log(&f.path), txn.id())
-                .await
-                .unwrap();
-            let crate::storage::MutationRecord::Put(_, _, value) = records.remove(0) else {
-                panic!("expected PUT");
-            };
-            let reopened = crate::storage::Store {
-                committed: log_file(&Fixture::open_log(&f.path)).await,
-                values: Fixture::open_values(&f.path),
-            };
-            let State::Collection(copy) = reopened
-                .resolve::<State<_>>(txn.id(), value.clone())
-                .await
-                .unwrap()
-            else {
-                panic!("expected collection");
-            };
-            let count: State<Txn> = copy
-                .get(&txn, &["count".parse().unwrap()], Value::None.into())
-                .await
-                .unwrap();
-            assert!(
-                matches!(count, State::Scalar(tc_ir::Scalar::Value(value)) if value == Value::from(1_u64))
-            );
-            copy.put(
-                &f.txn(3),
-                &["insert".parse().unwrap()],
-                if table {
-                    Value::Tuple(vec![Value::from(10_u64)])
-                } else {
-                    Value::None
-                }
-                .into(),
-                State::from(Value::Tuple(vec![Value::from(10_u64)])),
-            )
-            .await
-            .unwrap();
-            copy.commit(id(3)).await.unwrap();
-            copy.finalize(&id(3)).await.unwrap();
-            copy.sync_all().await.unwrap();
-            let (orphan, dir) = reopened.values.write().await.create_dir_unique().unwrap();
-            f.source(table).await.copy_into(&txn, dir).await.unwrap();
-            reopened.values.sync().await.unwrap();
-            let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-            assert!(
-                reopened
-                    .resolve::<State<_>>(txn.id(), value.clone())
-                    .await
-                    .is_err(),
-                "changed native rows must fail validation"
-            );
-            retain_records(&f.log, &[txn.id()]).await;
-            assert!(
-                SyncChain::load::<State<_>, _, _, _, _>(
-                    || f.canonical(false),
-                    Fixture::open_log(&f.path),
-                    Fixture::open_values(&f.path),
-                    TxnTaskQueue::new(64),
-                    |_| async {
-                        panic!("validate native values before requesting replay capabilities")
-                    }
-                )
-                .await
-                .is_err()
-            );
-            assert!(f.path.join("values").join(orphan.to_string()).is_dir());
-            assert_eq!(
-                std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
-                publication
-            );
-            reopened
-                .values
-                .write()
-                .await
-                .delete(
-                    crate::storage::reference(&value)
-                        .unwrap()
-                        .unwrap()
-                        .0
-                        .as_str(),
-                )
-                .await;
-            reopened.values.sync_deleted().await.unwrap();
-            assert!(reopened.resolve::<State<_>>(txn.id(), value).await.is_err());
-        }
-    });
-}
-
-#[test]
-fn failed_collection_arguments_are_reclaimed_on_load() {
+fn older_disjoint_wal_replays_after_newer_native_commit() {
     run(|| async {
         let f = Fixture::new();
-        let chain = f.chain(false).await;
-        assert!(
-            chain
-                .put(
-                    &f.txn(3),
-                    &["insert".parse().unwrap()],
-                    Value::None.into(),
-                    State::from(f.source(false).await)
-                )
-                .await
-                .is_err()
-        );
-        let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-        let txn = f.txn(2);
-        let path = ["insert".parse().unwrap()];
-        let source = State::from(f.source(false).await);
-        assert!(
-            chain
-                .put(&txn, &path, Value::None.into(), source)
-                .await
-                .is_err()
-        );
-        assert_eq!(f.values.read().await.len(), 1);
-        assert!(chain.commit(txn.id()).await.is_err());
-        chain.rollback(&id(4)).await.unwrap();
-        chain.rollback(&txn.id()).await.unwrap();
-        assert_eq!(
-            std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
-            publication
-        );
-        assert_eq!(f.values.read().await.len(), 1);
-        chain.finalize(&id(3)).await.unwrap();
-        assert_eq!(f.values.read().await.len(), 1);
-        f.values.sync().await.unwrap();
+        let chain = f.chain(true).await;
+        insert(&chain, &f.txn(2), true, 1).await.unwrap();
+        insert(&chain, &f.txn(3), true, 2).await.unwrap();
+        chain.commit(id(3)).await.unwrap();
+        chain.publish_before_subject_commit(id(2)).await;
         drop(chain);
-        let reopened = f.reopen().await.unwrap();
-        assert_eq!(count(&reopened, &f.txn(5)).await, 0);
-        assert!(Fixture::open_values(&f.path).read().await.is_empty());
-    });
-}
 
-#[test]
-fn cleanup_failure_fails_load_without_changing_the_wal() {
-    run(|| async {
-        let f = Fixture::new();
-        let chain = f.chain(false).await;
-        assert!(
-            chain
-                .put(
-                    &f.txn(2),
-                    &["insert".parse().unwrap()],
-                    Value::None.into(),
-                    State::from(f.source(false).await),
-                )
-                .await
-                .is_err()
-        );
-        f.values.sync_all().await.unwrap();
-        let name = f.values.read().await.names().next().unwrap().clone();
-        let path = f.path.join("values").join(name);
-        // Deliberately invalidate the delegated handle to inject a directory deletion error.
-        std::fs::remove_dir_all(&path).unwrap();
-        std::fs::write(&path, b"obstruction").unwrap();
-        chain.rollback(&id(2)).await.unwrap();
-        chain.finalize(&id(2)).await.unwrap();
-        let publication = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-        drop(chain);
-        let failure = SyncChain::load::<State<_>, _, _, _, _>(
-            || f.canonical(true),
-            Fixture::open_log(&f.path),
-            f.values.clone(),
-            TxnTaskQueue::new(64),
-            |_| async { panic!("no retained transactions") },
-        )
-        .await;
-        assert!(failure.is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"obstruction");
-        assert_eq!(
-            std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
-            publication
-        );
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        f.reopen().await.unwrap();
-        assert!(!path.exists());
+        let recovered = f.reopen().await.unwrap();
+        assert_eq!(count(&recovered, &f.txn(4)).await, 2);
     });
 }
 
@@ -1471,6 +1061,7 @@ fn published_transaction_is_not_overwritten() {
         )
         .await
         .unwrap();
+
         let path = f.path.join("log/committed.chain_block");
         let original = std::fs::read(&path).unwrap();
         insert(&chain, &f.txn(2), false, 1).await.unwrap();
@@ -1480,331 +1071,10 @@ fn published_transaction_is_not_overwritten() {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("already published")
+                .contains("already exists")
         );
+
         assert_eq!(std::fs::read(path).unwrap(), original);
-        assert!(chain.register(f.txn(3)).is_err());
-    });
-}
-
-#[test]
-fn collection_reclamation_preserves_the_committed_file_and_published_captures() {
-    run(|| async {
-        let f = Fixture::new();
-        let _chain = f.chain(false).await;
-        for name in [id(2).to_string(), crate::storage::COMMITTED.into()] {
-            f.values.write().await.create_dir(name).unwrap();
-        }
-        let store = crate::storage::Store {
-            committed: log_file(&f.log).await,
-            values: f.values.clone(),
-        };
-        let value = store
-            .capture::<State<_>>(&f.txn(4), State::from(f.source(false).await))
-            .await
-            .unwrap();
-        let name = crate::storage::reference(&value)
-            .unwrap()
-            .unwrap()
-            .0
-            .to_string();
-        write_records(
-            &f.log,
-            id(4),
-            vec![crate::MutationRecord::Put(
-                "/".parse().unwrap(),
-                tc_ir::Scalar::default(),
-                value,
-            )],
-        )
-        .await
-        .unwrap();
-        store.reclaim().await.unwrap();
-        assert_eq!(f.values.read().await.len(), 1);
-        assert!(f.values.read().await.get_dir(&name).is_some());
-        assert_eq!(f.log.read().await.len(), 1);
-        assert!(
-            f.log
-                .read()
-                .await
-                .get_file(crate::storage::COMMITTED)
-                .is_some()
-        );
-    });
-}
-
-#[test]
-fn native_record_paths_and_committed_structure_are_validated() {
-    run(|| async {
-        use crate::storage::{ChainBlock, MutationRecord};
-        for path in ["/", "/insert", "/nested/delete"] {
-            let f = Fixture::new();
-            crate::storage::create(&f.log).await.unwrap();
-            let records = vec![
-                MutationRecord::Put(
-                    path.parse().unwrap(),
-                    tc_ir::Scalar::default(),
-                    tc_ir::Scalar::default(),
-                ),
-                MutationRecord::Delete(path.parse().unwrap(), tc_ir::Scalar::default()),
-            ];
-            write_records(&f.log, id(2), records).await.unwrap();
-            let bytes = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-            assert!(
-                std::str::from_utf8(&bytes[32..])
-                    .unwrap()
-                    .contains(&format!("\"{path}\""))
-            );
-            let records = read_records(&Fixture::open_log(&f.path), id(2))
-                .await
-                .unwrap();
-            let expected: pathlink::PathBuf = path.parse().unwrap();
-            assert!(matches!(&records[0], MutationRecord::Put(actual, ..) if actual == &expected));
-            assert!(
-                matches!(&records[1], MutationRecord::Delete(actual, ..) if actual == &expected)
-            );
-        }
-        for path in ["/trailing/", "/double//slash"] {
-            let encoded = destream_json::encode((
-                path.to_string(),
-                tc_ir::Scalar::default(),
-                None::<tc_ir::Scalar>,
-            ))
-            .unwrap();
-            let decoded: Result<MutationRecord, _> = destream_json::try_decode((), encoded).await;
-            assert!(decoded.is_err());
-        }
-        for json in ["[]", "[null]", "[null,[],null]", "[7,null,[]]", "[null,{}]"] {
-            let stream = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(json))]);
-            let decoded: Result<(Option<TxnId>, ChainBlock), _> =
-                destream_json::try_decode((), stream).await;
-            assert!(decoded.is_err(), "{json}");
-        }
-    });
-}
-
-#[test]
-fn mutation_record_arity_is_unambiguous() {
-    run(|| async {
-        use crate::storage::MutationRecord;
-        for (json, valid, put) in [
-            (r#"["/",null]"#, true, false),
-            (r#"["/nested",null,null]"#, true, true),
-            ("[]", false, false),
-            (r#"["/"]"#, false, false),
-            (r#"["/",null,null,null]"#, false, false),
-        ] {
-            let stream = futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(json))]);
-            let decoded: Result<MutationRecord, _> = destream_json::try_decode((), stream).await;
-            assert_eq!(decoded.is_ok(), valid, "{json}");
-            if let Ok(record) = decoded {
-                assert_eq!(matches!(record, MutationRecord::Put(..)), put);
-            }
-        }
-    });
-}
-
-#[test]
-fn shared_blocks_preserve_order_and_reject_duplicate_ids() {
-    run(|| async {
-        use crate::storage::{ChainBlock, MutationRecord};
-        use futures::TryStreamExt;
-        for size in [0, 31, 32, 33] {
-            let block = (
-                bytes::Bytes::from(vec![7; size]),
-                std::collections::BTreeMap::from([
-                    (
-                        id(10),
-                        vec![MutationRecord::Delete(
-                            "/delete".parse().unwrap(),
-                            tc_ir::Scalar::default(),
-                        )],
-                    ),
-                    (
-                        id(2),
-                        vec![
-                            MutationRecord::Put(
-                                "/insert".parse().unwrap(),
-                                tc_ir::Scalar::default(),
-                                tc_ir::Scalar::default(),
-                            ),
-                            MutationRecord::Delete("/".parse().unwrap(), tc_ir::Scalar::default()),
-                        ],
-                    ),
-                ]),
-            );
-            let decoded: Result<ChainBlock, _> =
-                destream_json::try_decode((), destream_json::encode(block).unwrap()).await;
-            assert_eq!(decoded.is_ok(), size == 32);
-            if let Ok(block) = decoded {
-                assert_eq!(block.previous_hash, tc_ir::Sha256Hash::from([7; 32]));
-                assert_eq!(
-                    block.mutations.keys().copied().collect::<Vec<_>>(),
-                    vec![id(2), id(10)]
-                );
-                assert!(matches!(
-                    block.mutations[&id(2)][0],
-                    MutationRecord::Put(..)
-                ));
-                assert!(matches!(
-                    block.mutations[&id(2)][1],
-                    MutationRecord::Delete(..)
-                ));
-            }
-        }
-
-        let duplicate = destream::en::MapStream::from(futures::stream::iter([
-            (format!("0{}", id(2)), Vec::<MutationRecord>::new()),
-            (id(2).to_string(), Vec::<MutationRecord>::new()),
-        ]));
-        let encoded = destream_json::encode((bytes::Bytes::from_static(&[0; 32]), duplicate))
-            .unwrap()
-            .map_err(std::io::Error::other);
-        let decoded: Result<ChainBlock, _> = destream_json::try_decode((), encoded).await;
-        assert!(
-            decoded
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("duplicate block transaction ID")
-        );
-    });
-}
-
-#[test]
-fn borrowed_history_encoding_retains_references_without_cloning_the_tree() {
-    run(|| async {
-        use crate::storage::{ChainBlock, MutationRecord};
-        use futures::TryStreamExt;
-        let bytes: Arc<[u8]> = vec![42; 200_000].into();
-        let block = ChainBlock {
-            previous_hash: tc_ir::Sha256Hash::default(),
-            mutations: std::collections::BTreeMap::from([(
-                id(2),
-                vec![
-                    MutationRecord::Put(
-                        "/insert".parse().unwrap(),
-                        tc_ir::Scalar::default(),
-                        Value::Bytes(bytes.clone()).into(),
-                    ),
-                    MutationRecord::Put(
-                        "/".parse().unwrap(),
-                        tc_ir::Scalar::default(),
-                        tc_ir::Scalar::default(),
-                    ),
-                    MutationRecord::Delete("/".parse().unwrap(), tc_ir::Scalar::default()),
-                ],
-            )]),
-        };
-        let stream = destream_json::encode(&block).unwrap();
-        assert_eq!(
-            Arc::strong_count(&bytes),
-            2,
-            "constructing the stream must not clone the block"
-        );
-        let borrowed = stream
-            .try_fold(Vec::new(), |mut bytes, chunk| async move {
-                bytes.extend_from_slice(&chunk);
-                Ok(bytes)
-            })
-            .await
-            .unwrap();
-        assert_eq!(Arc::strong_count(&bytes), 2);
-        let owned = destream_json::encode(block)
-            .unwrap()
-            .try_fold(Vec::new(), |mut bytes, chunk| async move {
-                bytes.extend_from_slice(&chunk);
-                Ok(bytes)
-            })
-            .await
-            .unwrap();
-        assert_eq!(borrowed, owned);
-        assert_eq!(Arc::strong_count(&bytes), 1);
-    });
-}
-
-#[test]
-fn sync_rejects_blocks_outside_its_publication_contract() {
-    run(|| async {
-        for case in 0..3 {
-            let f = Fixture::new();
-            let chain = f.chain(false).await;
-            let mut committed = ChainFile::default();
-            committed.block.mutations.insert(
-                id(2),
-                vec![crate::MutationRecord::Delete(
-                    "/".parse().unwrap(),
-                    tc_ir::Scalar::default(),
-                )],
-            );
-            match case {
-                0 => committed.block.previous_hash = [1; 32].into(),
-                1 => committed.finalized = Some(id(2)),
-                2 => committed.block.mutations.get_mut(&id(2)).unwrap().clear(),
-                _ => unreachable!(),
-            }
-            write_log(&f.log, committed).await;
-            drop(chain);
-            let path = f.path.join("log/committed.chain_block");
-            let original = std::fs::read(&path).unwrap();
-            assert!(
-                SyncChain::load::<State<_>, _, _, _, _>(
-                    || f.canonical(true),
-                    Fixture::open_log(&f.path),
-                    Fixture::open_values(&f.path),
-                    TxnTaskQueue::new(64),
-                    |_| async { panic!("invalid block must fail before replay") }
-                )
-                .await
-                .is_err()
-            );
-            assert_eq!(std::fs::read(path).unwrap(), original);
-        }
-    });
-}
-
-#[test]
-fn large_payload_and_history_round_trip_without_fixed_quotas() {
-    run(|| async {
-        let f = Fixture::new();
-        crate::storage::create(&f.log).await.unwrap();
-        let value = "x".repeat(200_000);
-        let mut committed = ChainFile::default();
-        committed.block.mutations = (0..16384)
-            .map(|n| {
-                (
-                    id(n),
-                    vec![crate::MutationRecord::Delete(
-                        pathlink::PathBuf::new(),
-                        tc_ir::Scalar::default(),
-                    )],
-                )
-            })
-            .collect();
-        committed.block.mutations.insert(
-            id(2),
-            vec![crate::MutationRecord::Put(
-                pathlink::PathBuf::new(),
-                tc_ir::Scalar::default(),
-                Value::from(value.clone()).into(),
-            )],
-        );
-        write_log(&f.log, committed).await;
-        assert!(
-            std::fs::metadata(f.path.join("log/committed.chain_block"))
-                .unwrap()
-                .len()
-                > 1024 * 1024
-        );
-        let mut recovered = read_log(&Fixture::open_log(&f.path)).await.unwrap();
-        assert_eq!(recovered.block.mutations.len(), 16384);
-        let mut records = recovered.block.mutations.remove(&id(2)).unwrap();
-        let crate::storage::MutationRecord::Put(_, _, tc_ir::Scalar::Value(Value::String(actual))) =
-            records.remove(0)
-        else {
-            panic!("expected string");
-        };
-        assert_eq!(actual, value);
     });
 }
 
@@ -1821,16 +1091,18 @@ fn wal_batch_benchmark() {
                 } else {
                     (1, entry.metadata().unwrap().len())
                 };
+
                 total.0 += size.0;
                 total.1 += size.1;
             }
+
             total
         }
+
         for (batch, finalize) in [(true, false), (false, false), (false, true)] {
             let f = Fixture::new();
             let chain = f.chain(true).await;
             let start = std::time::Instant::now();
-            let path = f.path.join("log/committed.chain_block");
             eprintln!("WAL measurement root: {}", f.path.display());
             for n in 0..32_u16 {
                 let txn = f.txn(if batch { 2 } else { n + 2 });
@@ -1851,8 +1123,9 @@ fn wal_batch_benchmark() {
                 "32 scalar writes: batched={batch}, finalize={finalize}, elapsed={:?}, WAL files={}, retained WAL bytes={}; measure cumulative writes/barriers with strace",
                 start.elapsed(),
                 f.log.read().await.len(),
-                std::fs::metadata(path).unwrap().len()
+                retained(&f.path.join("log")).1
             );
+
             let read = std::time::Instant::now();
             assert_eq!(count(&chain, &f.txn(34)).await, 32);
             eprintln!(
@@ -1865,7 +1138,7 @@ fn wal_batch_benchmark() {
 }
 
 #[test]
-fn materialization_intent_prevents_loading_replay_and_cleanup() {
+fn native_finalization_recovers_before_chain_frontier_publication() {
     run(|| async {
         for table in [false, true] {
             for stage in 0..3 {
@@ -1875,11 +1148,6 @@ fn materialization_intent_prevents_loading_replay_and_cleanup() {
                 chain.commit(id(2)).await.unwrap();
                 insert(&chain, &f.txn(3), table, 2).await.unwrap();
                 chain.commit(id(3)).await.unwrap();
-                let mut log = read_log(&f.log).await.unwrap();
-                log.materializing = Some(id(3));
-                write_log(&f.log, log).await;
-                // Explicit restart states: before native writes, after only the first
-                // delta, and after all canonical data is durable. No power-loss claim.
                 if stage > 0 {
                     chain
                         .inner
@@ -1887,30 +1155,27 @@ fn materialization_intent_prevents_loading_replay_and_cleanup() {
                         .finalize(&id(if stage == 1 { 2 } else { 3 }))
                         .await
                         .unwrap();
-                    chain.inner.subject.sync_all().await.unwrap();
                 }
                 drop(chain);
-                std::fs::create_dir(f.path.join("values/orphan")).unwrap();
-                let before = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
-                let result = SyncChain::<Txn>::load::<State<_>, _, _, _, _>(
-                    || async { panic!("intent must be checked before native loading") },
+                let recovered = SyncChain::<Txn>::load::<State<_>, _, _, _, _>(
+                    || f.canonical(true),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
-                    TxnTaskQueue::new(64),
-                    |_| async { panic!("intent must prevent replay") },
+                    64,
+                    |_| async { panic!("durable native versions must not be replayed") },
                 )
-                .await;
+                .await
+                .unwrap();
+
+                assert_eq!(count(&recovered, &f.txn(4)).await, 2);
+                recovered.finalize(&id(3)).await.unwrap();
                 assert!(
-                    result
-                        .err()
+                    read_log(&Fixture::open_log(&f.path))
+                        .await
                         .unwrap()
-                        .to_string()
-                        .contains("recovery required")
-                );
-                assert!(f.path.join("values/orphan").exists());
-                assert_eq!(
-                    std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
-                    before
+                        .block
+                        .mutations
+                        .is_empty()
                 );
             }
         }
@@ -1918,7 +1183,7 @@ fn materialization_intent_prevents_loading_replay_and_cleanup() {
 }
 
 #[test]
-fn retained_requests_replay_after_workspace_removal_and_repeated_reopening() {
+fn native_commits_survive_workspace_removal_and_reopening() {
     run(|| async {
         for table in [false, true] {
             let f = Fixture::new();
@@ -1926,6 +1191,7 @@ fn retained_requests_replay_after_workspace_removal_and_repeated_reopening() {
             assert!(
                 tc_ir::Route::<State<Txn>>::route(&chain, &["restore".parse().unwrap()]).is_none()
             );
+
             insert(&chain, &f.txn(2), table, 7).await.unwrap();
             assert_eq!(count(&chain, &f.txn(2)).await, 1);
             assert_eq!(count(&chain, &f.txn(1)).await, 0);
@@ -1944,12 +1210,13 @@ fn retained_requests_replay_after_workspace_removal_and_repeated_reopening() {
                     Cache::<PersistentFile>::new(32 * 1024 * 1024, None, 0, Duration::from_secs(3))
                         .load(workspace)
                         .unwrap();
+
                 let calls = AtomicUsize::new(0);
                 let chain = SyncChain::load::<State<_>, _, _, _, _>(
                     || f.canonical(true),
                     Fixture::open_log(&f.path),
                     Fixture::open_values(&f.path),
-                    TxnTaskQueue::new(64),
+                    64,
                     |original| {
                         assert_eq!(original, id(2));
                         calls.fetch_add(1, Ordering::Relaxed);
@@ -1959,79 +1226,33 @@ fn retained_requests_replay_after_workspace_removal_and_repeated_reopening() {
                             path: vec![],
                             next: Arc::new(AtomicUsize::new(0)),
                         };
+
                         async move { Ok(txn) }
                     },
                 )
                 .await
                 .unwrap();
-                assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
                 chain.commit(id(2)).await.unwrap();
                 assert_eq!(count(&chain, &f.txn(3)).await, 1);
                 assert_eq!(
                     std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
                     before
                 );
+
                 if attempt == 1 {
                     chain.finalize(&id(2)).await.unwrap();
                     chain.finalize(&id(2)).await.unwrap();
                 }
             }
+
             let chain = f.reopen().await.unwrap();
             assert_eq!(count(&chain, &f.txn(3)).await, 1);
             let log = read_log(&Fixture::open_log(&f.path)).await.unwrap();
             assert_eq!(log.finalized, Some(id(2)));
-            assert_eq!(log.materializing, None);
             assert!(log.block.mutations.is_empty());
         }
-    });
-}
-
-#[test]
-fn retained_history_saturates_and_finalization_restores_capacity() {
-    run(|| async {
-        let f = Fixture::new();
-        let small = Cache::<ChainFile>::new(2048, None, 0, Duration::from_secs(3))
-            .load(f.path.join("log"))
-            .unwrap();
-        let chain = SyncChain::create(
-            f.canonical(false).await.unwrap(),
-            small,
-            f.values.clone(),
-            TxnTaskQueue::new(64),
-        )
-        .await
-        .unwrap();
-        let mut acknowledged = 0;
-        for n in 2..64 {
-            insert(&chain, &f.txn(n), false, u64::from(n))
-                .await
-                .unwrap();
-            if chain.commit(id(n)).await.is_err() {
-                break;
-            }
-            acknowledged += 1;
-        }
-        assert!((1..62).contains(&acknowledged));
-        drop(chain);
-        let chain = f.reopen().await.unwrap();
-        assert_eq!(count(&chain, &f.txn(64)).await, acknowledged);
-        chain.finalize(&id(64)).await.unwrap();
-        drop(chain);
-        let small = Cache::<ChainFile>::new(2048, None, 0, Duration::from_secs(3))
-            .load(f.path.join("log"))
-            .unwrap();
-        let chain = SyncChain::load::<State<_>, _, _, _, _>(
-            || f.canonical(true),
-            small,
-            Fixture::open_values(&f.path),
-            TxnTaskQueue::new(64),
-            |_| async { panic!("finalized requests must be absent") },
-        )
-        .await
-        .unwrap();
-        insert(&chain, &f.txn(65), false, 65).await.unwrap();
-        chain.commit(id(65)).await.unwrap();
-        assert_eq!(count(&chain, &f.txn(66)).await, acknowledged + 1);
     });
 }
 
@@ -2042,20 +1263,18 @@ fn cutoff_only_and_duplicate_finalization_do_not_touch_native_storage() {
         let dir = Cache::<PersistentFile>::new(32 * 1024 * 1024, None, 0, Duration::from_secs(3))
             .load(f.path.join("canonical"))
             .unwrap();
+
         let subject = Fixture::subject(dir.clone(), false, false).await.unwrap();
-        let chain = SyncChain::create(
-            subject,
-            f.log.clone(),
-            f.values.clone(),
-            TxnTaskQueue::new(64),
-        )
-        .await
-        .unwrap();
+        let chain = SyncChain::create(subject, f.log.clone(), f.values.clone(), 64)
+            .await
+            .unwrap();
+
         let held = dir.write().await;
         tokio::time::timeout(Duration::from_secs(1), chain.finalize(&id(2)))
             .await
             .unwrap()
             .unwrap();
+
         drop(held);
 
         insert(&chain, &f.txn(3), false, 7).await.unwrap();
@@ -2064,50 +1283,122 @@ fn cutoff_only_and_duplicate_finalization_do_not_touch_native_storage() {
         let before = std::fs::read(f.path.join("log/committed.chain_block")).unwrap();
         let file = log_file(&f.log).await;
         let log_guard = file.read::<ChainFile>().await.unwrap();
-        assert_eq!(log_guard.finalized, Some(id(2)));
-        assert_eq!(log_guard.block.mutations.len(), 1);
-        assert_eq!(log_guard.block.mutations[&id(3)].len(), 1);
+        assert_eq!(log_guard.frontier().unwrap(), Some(id(2)));
+        assert_eq!(read_records(&f.log, id(3)).await.unwrap().len(), 1);
         tokio::time::timeout(Duration::from_secs(1), chain.finalize(&id(2)))
             .await
             .unwrap()
             .unwrap();
+
         assert_eq!(
             std::fs::read(f.path.join("log/committed.chain_block")).unwrap(),
             before
         );
+
         drop(log_guard);
         drop(held);
     });
 }
 
 #[test]
-fn storage_pressure_prevents_commit_without_discarding_evidence() {
+fn storage_pressure_rejects_before_mutation_and_preserves_rollback() {
     run(|| async {
         let mut f = Fixture::new();
-        f.log = Cache::<ChainFile>::new(1024, None, 0, Duration::from_secs(3))
+        f.log = Cache::<ChainFile>::new(8192, None, 0, Duration::from_secs(3))
             .load(f.path.join("log"))
             .unwrap();
+
         let chain = SyncChain::create(
             f.canonical(false).await.unwrap(),
             f.log.clone(),
             f.values.clone(),
-            TxnTaskQueue::new(128),
+            128,
         )
         .await
         .unwrap();
-        for key in 0..128 {
-            insert(&chain, &f.txn(2), false, key).await.unwrap();
+
+        let mut admitted = 0;
+        while admitted < 128 {
+            if insert(&chain, &f.txn(2), false, admitted).await.is_err() {
+                break;
+            }
+
+            admitted += 1;
         }
+
+        assert!(admitted > 0 && admitted < 128);
+        // Inspect through the native owner: the queue correctly rejects further
+        // use of a failed transaction until its caller rolls it back.
+        let Collection::BTree(subject) = &chain.inner.subject else {
+            unreachable!()
+        };
+
+        assert_eq!(subject.count(id(2)).await.unwrap(), admitted);
         assert!(chain.commit(id(2)).await.is_err());
-        assert!(chain.commit(id(2)).await.is_err());
+        chain.rollback(&id(2)).await.unwrap();
         assert!(read_log(&f.log).await.unwrap().block.mutations.is_empty());
         assert_eq!(
             f.log.read().await.len(),
             1,
             "storage rejection preserves the committed file"
         );
+
+        assert_eq!(count(&chain, &f.txn(3)).await, 0);
+        insert(&chain, &f.txn(3), false, 999).await.unwrap();
+        chain.commit(id(3)).await.unwrap();
         drop(chain);
-        assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(3)).await, 0);
+        assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(4)).await, 1);
+    });
+}
+
+#[test]
+fn oversized_record_payloads_do_not_invoke_selected_mutations() {
+    run(|| async {
+        let mut f = Fixture::new();
+        f.log = Cache::<ChainFile>::new(8192, None, 0, Duration::from_secs(3))
+            .load(f.path.join("log"))
+            .unwrap();
+
+        let chain = f.chain(false).await;
+        let called = AtomicBool::new(false);
+        assert!(
+            chain
+                .put_recorded(
+                    &f.txn(2),
+                    pathlink::PathBuf::new(),
+                    Value::None.into(),
+                    State::<Txn>::from(Value::from("v".repeat(65536))),
+                    |_| async {
+                        called.store(true, Ordering::Relaxed);
+                        Ok(())
+                    },
+                )
+                .await
+                .is_err()
+        );
+
+        assert!(!called.load(Ordering::Relaxed));
+        chain.rollback(&id(2)).await.unwrap();
+        assert!(
+            chain
+                .delete_recorded(
+                    &f.txn(3),
+                    pathlink::PathBuf::new(),
+                    Value::from("k".repeat(65536)).into(),
+                    || async {
+                        called.store(true, Ordering::Relaxed);
+                        Ok(())
+                    },
+                )
+                .await
+                .is_err()
+        );
+
+        assert!(!called.load(Ordering::Relaxed));
+        chain.rollback(&id(3)).await.unwrap();
+        assert_eq!(count(&chain, &f.txn(4)).await, 0);
+        insert(&chain, &f.txn(4), false, 1).await.unwrap();
+        chain.commit(id(4)).await.unwrap();
     });
 }
 
@@ -2118,17 +1409,23 @@ fn collection_views_are_not_persistent_subjects() {
         let Collection::BTree(mut view) = f.source(false).await else {
             unreachable!()
         };
-        view.reverse = true;
+
+        *view = view.slice(
+            (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+            true,
+        );
+
         assert!(
             SyncChain::create(
                 Collection::BTree(view.clone()),
                 f.log.clone(),
                 f.values.clone(),
-                TxnTaskQueue::new(64)
+                64
             )
             .await
             .is_err()
         );
+
         let chain = f.chain(false).await;
         drop(chain);
         assert!(
@@ -2136,7 +1433,7 @@ fn collection_views_are_not_persistent_subjects() {
                 || async { Ok(Collection::BTree(view)) },
                 Fixture::open_log(&f.path),
                 Fixture::open_values(&f.path),
-                TxnTaskQueue::new(64),
+                64,
                 |_| async { Ok(f.txn(2)) }
             )
             .await
@@ -2145,147 +1442,630 @@ fn collection_views_are_not_persistent_subjects() {
     });
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_collection_writes_are_recorded_and_views_remain_read_only() {
+    for table in [false, true] {
+        let f = Fixture::new();
+        let chain = Box::pin(f.chain(table)).await;
+        // Each phase owns its test temporaries; boxing avoids embedding their
+        // native collection futures in the ordinary Tokio test's stack frame.
+        Box::pin(check_selected_collection_views(&f, &chain, table)).await;
+        let expected = Box::pin(write_selected_collection_history(&f, &chain, table)).await;
+        drop(chain);
+        Box::pin(check_unmaterialized_collection(&f, table)).await;
+        let replayed = Box::pin(replay_selected_collection_history(&f)).await;
+        Box::pin(finalize_selected_collection_history(&f, replayed, expected)).await;
+    }
+}
+
+async fn check_selected_collection_views(f: &Fixture, chain: &SyncChain<Txn>, table: bool) {
+    for n in [1, 2] {
+        insert(chain, &f.txn(2), table, n).await.unwrap();
+    }
+
+    chain.commit(id(2)).await.unwrap();
+    let records = read_records(&f.log, id(2)).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| matches!(record,
+        crate::MutationRecord::Put(path, _, _) if path[..] == ["insert"]
+    )));
+
+    {
+        let full: State<Txn> = chain.get(&f.txn(3), &[], Scalar::default()).await.unwrap();
+        let State::Collection(full) = full else {
+            panic!("expected a collection view");
+        };
+
+        let selected = if table {
+            Scalar::Value(Value::Tuple(vec![Value::Tuple(vec![
+                Value::from("key"),
+                Value::from(2_u64),
+            ])]))
+        } else {
+            Scalar::Map(
+                [("start".parse().unwrap(), Scalar::from(2_u64))]
+                    .into_iter()
+                    .collect(),
+            )
+        };
+
+        let selected: State<Txn> = chain.get(&f.txn(3), &[], selected).await.unwrap();
+        let State::Collection(selected) = selected else {
+            panic!("expected a selected collection view");
+        };
+
+        for view in [&full, &selected] {
+            assert!(!view.is_persistent());
+            assert!(view.as_btree().is_none());
+            if let Some(table) = view.as_table() {
+                assert!(!matches!(table, tc_collection::table::Table::File(_)));
+            }
+
+            assert!(view.commit(id(3)).await.is_err());
+            assert!(view.rollback(&id(3)).await.is_err());
+            assert!(view.finalize(&id(3)).await.is_err());
+            assert!(
+                view.put(
+                    &f.txn(3),
+                    &["insert".parse().unwrap()],
+                    if table {
+                        Value::Tuple(vec![7_u64.into()])
+                    } else {
+                        Value::None
+                    }
+                    .into(),
+                    State::from(Value::Tuple(vec![7_u64.into()])),
+                )
+                .await
+                .is_err()
+            );
+
+            assert!(
+                Public::<State<Txn>>::delete(
+                    view,
+                    &f.txn(3),
+                    &[],
+                    Value::Tuple(vec![2_u64.into()]).into(),
+                )
+                .await
+                .is_err()
+            );
+        }
+
+        assert_eq!(count(chain, &f.txn(3)).await, 2);
+        let copy = Box::pin(Collection::copy_from(&f.txn(3), f.working().await, &full))
+            .await
+            .unwrap();
+
+        assert!(copy.is_persistent());
+        copy.put(
+            &f.txn(3),
+            &["insert".parse().unwrap()],
+            if table {
+                Value::Tuple(vec![7_u64.into()])
+            } else {
+                Value::None
+            }
+            .into(),
+            State::from(Value::Tuple(vec![7_u64.into()])),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            copy.hash(id(3)).await.unwrap(),
+            full.hash(id(3)).await.unwrap()
+        );
+
+        assert_eq!(count(chain, &f.txn(3)).await, 2);
+    }
+}
+
+async fn write_selected_collection_history(
+    f: &Fixture,
+    chain: &SyncChain<Txn>,
+    table: bool,
+) -> tc_ir::Sha256Hash {
+    insert(chain, &f.txn(3), table, 3).await.unwrap();
+    let selected = Value::Tuple(vec![Value::Tuple(vec![
+        Value::from("key"),
+        Value::from(2_u64),
+    ])]);
+
+    if table {
+        chain
+            .put(
+                &f.txn(3),
+                &[],
+                selected.clone().into(),
+                State::from(Scalar::Map(
+                    [("value".parse().unwrap(), Scalar::from(22_u64))]
+                        .into_iter()
+                        .collect(),
+                )),
+            )
+            .await
+            .unwrap();
+    }
+
+    Public::<State<Txn>>::delete(
+        chain,
+        &f.txn(3),
+        &[],
+        if table {
+            Value::Tuple(vec![Value::Tuple(vec![Value::from("key"), 1_u64.into()])])
+        } else {
+            Value::Tuple(vec![1_u64.into()])
+        }
+        .into(),
+    )
+    .await
+    .unwrap();
+
+    chain.commit(id(3)).await.unwrap();
+    assert_eq!(count(chain, &f.txn(3)).await, 2);
+    let expected = chain.hash(&f.txn(3)).await.unwrap();
+    let records = read_records(&f.log, id(3)).await.unwrap();
+    assert_eq!(records.len(), if table { 3 } else { 2 });
+    if table {
+        assert!(
+            matches!(&records[1], crate::MutationRecord::Put(path, key, _)
+            if path.is_empty() && *key == Scalar::from(selected))
+        );
+    }
+
+    assert!(
+        matches!(records.last().unwrap(), crate::MutationRecord::Delete(path, _)
+        if path.is_empty())
+    );
+
+    insert(chain, &f.txn(4), table, 99).await.unwrap();
+    Public::<State<Txn>>::delete(
+        chain,
+        &f.txn(4),
+        &[],
+        Value::Tuple(vec![3_u64.into()]).into(),
+    )
+    .await
+    .unwrap();
+
+    chain.rollback(&id(4)).await.unwrap();
+    assert!(chain.commit(id(4)).await.is_err());
+    assert_eq!(chain.hash(&f.txn(5)).await.unwrap(), expected);
+    assert_eq!(
+        read_log(&f.log)
+            .await
+            .unwrap()
+            .block
+            .mutations
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![id(2), id(3)],
+    );
+
+    expected
+}
+
+async fn check_unmaterialized_collection(f: &Fixture, table: bool) {
+    let canonical = Box::pin(f.canonical(true)).await.unwrap();
+    let untouched = Box::pin(f.source(table)).await;
+    assert_eq!(
+        canonical.hash(id(1)).await.unwrap(),
+        untouched.hash(id(1)).await.unwrap()
+    );
+}
+
+async fn replay_selected_collection_history(f: &Fixture) -> SyncChain<Txn> {
+    let mut replayed_ids = Vec::new();
+    let replayed = Box::pin(SyncChain::load::<State<_>, _, _, _, _>(
+        || f.canonical(true),
+        Fixture::open_log(&f.path),
+        Fixture::open_values(&f.path),
+        64,
+        |original| {
+            replayed_ids.push(original);
+            let mut txn = f.txn(2).subcontext_unique();
+            txn.id = original;
+            async move { Ok(txn) }
+        },
+    ))
+    .await
+    .unwrap();
+
+    assert!(replayed_ids.is_empty());
+    replayed
+}
+
+async fn finalize_selected_collection_history(
+    f: &Fixture,
+    replayed: SyncChain<Txn>,
+    expected: tc_ir::Sha256Hash,
+) {
+    assert_eq!(replayed.hash(&f.txn(5)).await.unwrap(), expected);
+    assert_eq!(count(&replayed, &f.txn(5)).await, 2);
+    Box::pin(replayed.finalize(&id(3))).await.unwrap();
+    assert!(
+        read_log(&Fixture::open_log(&f.path))
+            .await
+            .unwrap()
+            .block
+            .mutations
+            .is_empty()
+    );
+
+    drop(replayed);
+    let reopened = Box::pin(f.reopen()).await.unwrap();
+    assert_eq!(reopened.hash(&f.txn(5)).await.unwrap(), expected);
+    assert_eq!(count(&reopened, &f.txn(5)).await, 2);
+}
+
 #[test]
 fn native_restoration_is_transactional_and_recoverable() {
     run(|| async {
         for table in [false, true] {
             let f = Fixture::new();
-            let chain = f.chain(table).await;
-            insert(&chain, &f.txn(2), table, 1).await.unwrap();
-            chain.commit(id(2)).await.unwrap();
-            let snapshot = f.source(table).await;
-            for key in [8_u64, 9] {
-                snapshot
-                    .put(
-                        &f.txn(3),
-                        &["insert".parse().unwrap()],
-                        if table {
-                            Value::Tuple(vec![Value::from(key)])
-                        } else {
-                            Value::None
-                        }
-                        .into(),
-                        State::from(Value::Tuple(vec![Value::from(key)])),
-                    )
-                    .await
-                    .unwrap();
-            }
-            snapshot.commit(id(3)).await.unwrap();
-            chain.restore_from(&f.txn(4), &snapshot).await.unwrap();
-            assert_eq!(count(&chain, &f.txn(4)).await, 2);
-            assert_eq!(count(&chain, &f.txn(3)).await, 1);
-            chain.rollback(&id(4)).await.unwrap();
-            assert_eq!(count(&chain, &f.txn(5)).await, 1);
-            assert!(
-                chain
-                    .restore_from(&f.txn(5), &f.source(!table).await)
-                    .await
-                    .is_err()
-            );
-            chain.rollback(&id(5)).await.unwrap();
-            let mismatched = if table {
-                let dtype = Value::from(0_u64).class();
-                let schema = TableSchema::new(
-                    vec![Column {
-                        name: "other_key".parse().unwrap(),
-                        dtype: dtype.clone(),
-                    }],
-                    vec![Column {
-                        name: "value".parse().unwrap(),
-                        dtype,
-                    }],
-                    vec![],
-                    StorageConfig::default(),
-                )
-                .unwrap();
-                PersistentTable::<Txn>::try_new(f.working().await, schema)
-                    .unwrap()
-                    .into()
-            } else {
-                let Collection::BTree(mut view) = f.source(false).await else {
-                    unreachable!()
-                };
-                view.schema[0].name = "other_key".into();
-                Collection::BTree(view)
-            };
-            assert!(chain.restore_from(&f.txn(6), &mismatched).await.is_err());
-            chain.rollback(&id(6)).await.unwrap();
+            let chain = Box::pin(f.chain(table)).await;
+            // Separate scenario phases so debug temporaries do not accumulate in
+            // one poll frame. Native calls still run on ordinary worker stacks.
+            let snapshot = Box::pin(stage_restoration(&f, &chain, table)).await;
+            Box::pin(check_restoration_errors(&f, &chain, table)).await;
             chain.restore_from(&f.txn(7), &snapshot).await.unwrap();
             chain.commit(id(7)).await.unwrap();
             drop(chain);
-            let chain = f.reopen().await.unwrap();
-            assert_eq!(count(&chain, &f.txn(8)).await, 2);
-            chain.finalize(&id(7)).await.unwrap();
-            drop(chain);
-            assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(8)).await, 2);
+            Box::pin(check_restoration_recovery(&f)).await;
         }
     });
 }
 
-#[test]
-fn restoration_cancellation_and_unaccepted_replay_preserve_original_identity() {
-    run(|| async {
-        for table in [false, true] {
-            let f = Fixture::new();
-            let chain = f.chain(table).await;
-            insert(&chain, &f.txn(2), table, 1).await.unwrap();
-            chain.commit(id(2)).await.unwrap();
-            let snapshot = f.source(table).await;
-            let store = crate::storage::Store {
-                committed: log_file(&f.log).await,
-                values: f.values.clone(),
-            };
-            let value = store
-                .capture::<State<_>>(&f.txn(3), snapshot.clone().into())
-                .await
-                .unwrap();
-            let txn = f.txn(3);
-            let workspace = txn.root.write().await;
-            let mut restore = Box::pin(chain.restore_from(&txn, &snapshot));
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), &mut restore)
-                    .await
-                    .is_err()
-            );
-            drop(restore);
-            drop(workspace);
-            assert!(chain.commit(id(3)).await.is_err());
-            chain.rollback(&id(3)).await.unwrap();
-            assert_eq!(count(&chain, &f.txn(4)).await, 1);
+async fn stage_restoration(f: &Fixture, chain: &SyncChain<Txn>, table: bool) -> Collection<Txn> {
+    insert(chain, &f.txn(2), table, 1).await.unwrap();
+    chain.commit(id(2)).await.unwrap();
 
-            let records = vec![crate::MutationRecord::Restore(value)];
-            store.sync(&records).await.unwrap();
-            write_records(&f.log, id(4), records).await.unwrap();
-            drop(chain);
-            let calls = AtomicUsize::new(0);
-            let chain = SyncChain::load::<State<_>, _, _, _, _>(
-                || f.canonical(true),
-                Fixture::open_log(&f.path),
-                Fixture::open_values(&f.path),
-                TxnTaskQueue::new(64),
-                |txn_id| {
-                    assert!([id(2), id(4)].contains(&txn_id));
-                    calls.fetch_add(1, Ordering::Relaxed);
-                    let mut txn = f.txn(4);
-                    txn.id = txn_id;
-                    std::future::ready(Ok(txn))
-                },
+    let snapshot = f.source(table).await;
+    for key in [8_u64, 9] {
+        snapshot
+            .put(
+                &f.txn(3),
+                &["insert".parse().unwrap()],
+                if table {
+                    Value::Tuple(vec![Value::from(key)])
+                } else {
+                    Value::None
+                }
+                .into(),
+                State::from(Value::Tuple(vec![Value::from(key)])),
             )
             .await
             .unwrap();
-            assert_eq!(calls.load(Ordering::Relaxed), 2);
-            assert_eq!(count(&chain, &f.txn(5)).await, 0);
+    }
+
+    snapshot.commit(id(3)).await.unwrap();
+
+    chain.restore_from(&f.txn(4), &snapshot).await.unwrap();
+    assert_eq!(count(chain, &f.txn(4)).await, 2);
+    assert_eq!(count(chain, &f.txn(3)).await, 1);
+
+    chain.rollback(&id(4)).await.unwrap();
+    assert_eq!(count(chain, &f.txn(5)).await, 1);
+    snapshot
+}
+
+async fn check_restoration_errors(f: &Fixture, chain: &SyncChain<Txn>, table: bool) {
+    assert!(
+        chain
+            .restore_from(&f.txn(5), &f.source(!table).await)
+            .await
+            .is_err()
+    );
+
+    chain.rollback(&id(5)).await.unwrap();
+
+    let mismatched = if table {
+        let dtype = ValueType::Number(NumberType::Number);
+        let schema = TableSchema::new(
+            vec![Column {
+                name: "other_key".parse().unwrap(),
+                dtype: dtype.clone(),
+            }],
+            vec![Column {
+                name: "value".parse().unwrap(),
+                dtype,
+            }],
+            vec![],
+            StorageConfig::default(),
+        )
+        .unwrap();
+
+        PersistentTable::<Txn>::try_new(f.working().await, schema)
+            .await
+            .unwrap()
+            .into()
+    } else {
+        Collection::<Txn>::create(
+            f.working().await,
+            tc_collection::collection::CollectionSchema::BTree(
+                vec![BTreeColumnSchema {
+                    name: "other_key".into(),
+                    dtype: ValueType::Number(NumberType::Number),
+                    max_size: None,
+                }]
+                .try_into()
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+    };
+
+    assert!(chain.restore_from(&f.txn(6), &mismatched).await.is_err());
+    chain.rollback(&id(6)).await.unwrap();
+}
+
+async fn check_restoration_recovery(f: &Fixture) {
+    let chain = f.reopen().await.unwrap();
+    assert_eq!(count(&chain, &f.txn(8)).await, 2);
+
+    chain.finalize(&id(7)).await.unwrap();
+    drop(chain);
+    assert_eq!(count(&f.reopen().await.unwrap(), &f.txn(8)).await, 2);
+}
+
+#[test]
+fn tensor_values_replay_with_original_transaction_ids_and_materialize_at_cutoff() {
+    run(|| async {
+        use tc_collection::collection::CollectionSchema;
+        use tc_collection::tensor::{AxisRange, Tensor, TensorSchema};
+
+        for (sparse, floating) in [(false, false), (true, false), (false, true), (true, true)] {
+            let f = Fixture::new();
+            let template = if floating {
+                Tensor::dense_f64(&f.txn(1), vec![4], vec![0.0; 4])
+                    .await
+                    .unwrap()
+            } else {
+                Tensor::dense_u64(&f.txn(1), vec![4], vec![0; 4])
+                    .await
+                    .unwrap()
+            };
+
+            let schema = CollectionSchema::Tensor(
+                TensorSchema::new(template.number_type(), vec![4].into(), sparse.then_some(0))
+                    .unwrap(),
+            );
+
+            let native = || {
+                Cache::<PersistentFile>::new(1 << 20, None, 0, Duration::from_secs(3))
+                    .load(f.path.join("canonical"))
+                    .unwrap()
+            };
+
+            let subject = Collection::<Txn>::create(native(), schema.clone())
+                .await
+                .unwrap();
+
+            let chain = SyncChain::create(subject, f.log.clone(), f.values.clone(), 64)
+                .await
+                .unwrap();
+
+            let coordinate = || Value::Tuple(vec![2u64.into()]);
+            chain
+                .put(
+                    &f.txn(2),
+                    &[],
+                    coordinate().into(),
+                    State::from(Value::from(7u64)),
+                )
+                .await
+                .unwrap();
+
+            chain.commit(id(2)).await.unwrap();
+            let view: State<Txn> = chain.get(&f.txn(3), &[], Value::None.into()).await.unwrap();
+            let State::Collection(Collection::Tensor(tensor)) = view else {
+                panic!("native Tensor view")
+            };
+
+            for view in [
+                tensor.clone(),
+                tensor
+                    .clone()
+                    .slice(vec![AxisRange::In(0, 4, 1)].into())
+                    .unwrap(),
+                tensor
+                    .clone()
+                    .slice(vec![AxisRange::In(1, 3, 1)].into())
+                    .unwrap(),
+                tensor.clone().transpose(None).unwrap(),
+            ] {
+                assert!(!view.is_persistent());
+                assert!(
+                    view.write_value(&f.txn(3), &[0], 99_u64.into())
+                        .await
+                        .is_err()
+                );
+
+                assert!(view.fill(&f.txn(3), 99_u64.into()).await.is_err());
+                assert!(view.commit(id(3)).await.is_err());
+                assert!(view.rollback(&id(3)).await.is_err());
+                assert!(view.finalize(&id(3)).await.is_err());
+            }
+
+            let copy =
+                tc_collection::tensor::Tensor::copy_from(&f.txn(3), f.working().await, &tensor)
+                    .await
+                    .unwrap();
+
+            assert!(copy.is_persistent());
+            copy.write_value(&f.txn(3), &[2], 99_u64.into())
+                .await
+                .unwrap();
+
+            assert_eq!(copy.read_value(id(3), &[2]).await.unwrap(), 99_u64.into());
+            assert_eq!(tensor.read_value(id(3), &[2]).await.unwrap(), 7_u64.into());
+            drop(copy);
+            let factor = if floating { 0.1f64.into() } else { 2u64.into() };
+            let expected = if floating {
+                (7.0 * 0.1f64).into()
+            } else {
+                14u64.into()
+            };
+            let accepted = tensor.mul_scalar(id(3), factor).await.unwrap();
+
+            chain
+                .put(
+                    &f.txn(3),
+                    &[],
+                    Value::None.into(),
+                    State::from(Collection::Tensor(accepted)),
+                )
+                .await
+                .unwrap();
+
+            let selected = Value::Tuple(vec![Value::Tuple(vec![0_u64.into(), 2_u64.into()])]);
+            chain
+                .put(
+                    &f.txn(3),
+                    &[],
+                    selected.clone().into(),
+                    State::from(Value::from(9_u64)),
+                )
+                .await
+                .unwrap();
+
+            Public::<State<Txn>>::delete(
+                &chain,
+                &f.txn(3),
+                &[],
+                Value::Tuple(vec![0_u64.into()]).into(),
+            )
+            .await
+            .unwrap();
+
+            chain.publish_before_subject_commit(id(3)).await;
+            let expected_hash = chain.hash(&f.txn(3)).await.unwrap();
+            let records = read_records(&f.log, id(2)).await.unwrap();
+            assert_eq!(records.len(), 1);
             assert!(
-                !read_log(&Fixture::open_log(&f.path))
+                matches!(&records[0], crate::MutationRecord::Put(path, key, value)
+                if path.is_empty() && *key == Scalar::from(coordinate()) && matches!(value.as_ref(), crate::StoredValue::Scalar(value) if *value == Scalar::from(7_u64)))
+            );
+
+            let records = read_records(&f.log, id(3)).await.unwrap();
+            assert_eq!(records.len(), 3);
+            assert!(
+                matches!(&records[0], crate::MutationRecord::Put(path, key, _)
+                if path.is_empty() && *key == Scalar::default())
+            );
+
+            assert!(
+                matches!(&records[1], crate::MutationRecord::Put(path, key, value)
+                if path.is_empty() && *key == Scalar::from(selected.clone()) && matches!(value.as_ref(), crate::StoredValue::Scalar(value) if *value == Scalar::from(9_u64)))
+            );
+
+            assert!(
+                matches!(&records[2], crate::MutationRecord::Delete(path, key)
+                if path.is_empty() && *key == Scalar::from(Value::Tuple(vec![0_u64.into()])))
+            );
+
+            assert_eq!(
+                read_log(&f.log)
                     .await
                     .unwrap()
                     .block
                     .mutations
-                    .is_empty()
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![id(2), id(3)],
             );
-            assert!(chain.rollback(&id(2)).await.is_err());
-            chain.commit(id(2)).await.unwrap();
-            chain.commit(id(4)).await.unwrap();
+
+            drop(tensor);
+            drop(chain);
+            let canonical = Collection::<Txn>::load(native(), schema.clone())
+                .await
+                .unwrap();
+
+            let before: State<Txn> = canonical
+                .get(&f.txn(1), &[], coordinate().into())
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&before, State::Scalar(scalar) if matches!(&scalar, Scalar::Value(value) if matches!(&value, Value::Number(n) if *n == 0u64.into())))
+            );
+
+            drop(canonical);
+            let mut replayed_ids = Vec::new();
+            let replayed = SyncChain::load::<State<_>, _, _, _, _>(
+                || Collection::<Txn>::load(native(), schema.clone()),
+                Fixture::open_log(&f.path),
+                Fixture::open_values(&f.path),
+                64,
+                |original| {
+                    assert!(original == id(2) || original == id(3));
+                    replayed_ids.push(original);
+                    let mut txn = f.txn(2).subcontext_unique();
+                    txn.id = original;
+                    async move { Ok(txn) }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(replayed_ids, vec![id(3)]);
+            assert_eq!(replayed.hash(&f.txn(5)).await.unwrap(), expected_hash);
+            for (coord, expected) in [(0_u64, 0_u64), (1, 9)] {
+                let value: State<Txn> = replayed
+                    .get(&f.txn(5), &[], Value::Tuple(vec![coord.into()]).into())
+                    .await
+                    .unwrap();
+
+                assert!(
+                    matches!(&value, State::Scalar(Scalar::Value(Value::Number(number)))
+                    if *number == expected.into())
+                );
+            }
+
+            let value: State<Txn> = replayed
+                .get(&f.txn(3), &[], coordinate().into())
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&value, State::Scalar(scalar) if matches!(&scalar, Scalar::Value(value) if matches!(&value, Value::Number(n) if *n == expected)))
+            );
+
+            replayed.finalize(&id(3)).await.unwrap();
+            let canonical = Collection::<Txn>::load(native(), schema.clone())
+                .await
+                .unwrap();
+
+            let value: State<Txn> = canonical
+                .get(&f.txn(5), &[], coordinate().into())
+                .await
+                .unwrap();
+
+            assert!(
+                matches!(&value, State::Scalar(scalar) if matches!(&scalar, Scalar::Value(value) if matches!(&value, Value::Number(n) if *n == expected)))
+            );
+
+            drop(canonical);
+            drop(replayed);
+            let reopened = SyncChain::load::<State<_>, _, _, _, _>(
+                || Collection::<Txn>::load(native(), schema.clone()),
+                Fixture::open_log(&f.path),
+                Fixture::open_values(&f.path),
+                64,
+                |original| async move {
+                    Err(tc_error::TCError::bad_request(format!(
+                        "unexpected replay after finalization: {original}",
+                    )))
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(reopened.hash(&f.txn(5)).await.unwrap(), expected_hash);
         }
     });
 }

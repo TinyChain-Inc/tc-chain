@@ -5,15 +5,14 @@ This roadmap contains unimplemented work. All variants must satisfy the common
 
 ## SyncChain integration
 
-- Integrate the implemented WAL with executable Services and host readiness.
 - Integrate caller-owned admission for retained transaction memory before claiming
   end-to-end bounded resource use; storage cache admission alone does not cover it.
 - Demonstrate coordinated snapshot synchronization through the Service/Cluster
-  path while preserving the original transaction capability. Select authoritative
+  path for corrupt or divergent native storage while preserving the original transaction capability. Select authoritative
   replacement using authenticated membership and history/checkpoint evidence;
-  resources with unfinished materialization remain unavailable until this exists.
+  resources with corrupt referenced storage remain unavailable until this exists.
 - Extend restart and syscall-failure evidence with deployment-filesystem
-  power-loss validation of WAL publication and canonical materialization ordering.
+  power-loss validation of WAL publication, native receipt, and atomic compaction ordering.
 - Evaluate bounded group commit against measured workloads without adding a
   second persistence model or weakening durability.
 
@@ -35,8 +34,6 @@ This roadmap contains unimplemented work. All variants must satisfy the common
 
 ## Integration
 
-- Add the Service-owned composition before exposing named persistent collection
-  URIs.
 - Integrate Chain-coordinated recovery and resynchronization with host readiness.
 - Add cross-host acceptance proving all variants preserve the original TxnId and
   use one Cluster/Service/Chain/collection path.

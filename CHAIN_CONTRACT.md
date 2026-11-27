@@ -7,10 +7,11 @@ the SyncChain write-ahead log. Public Service hosting is owned by the caller.
 
 Filesystem writeback and durability are distinct: ordinary `freqfs::sync()` and
 eviction are buffered. Chain synchronizes captures before atomically publishing
-requests with `replace_all()`. Collection commit establishes in-memory visibility;
-Chain retains durable requests until canonical materialization completes.
-Callers supply durable storage roots. Unreferenced captures are reclaimed only
-after successful coordinated recovery.
+each transaction file with a file/directory durability barrier, then delegates
+Collection's independently durable commit. Chain retains requests until native
+finalization and its own frontier publication complete.
+Callers supply durable storage roots. Rollback and finalization reclaim their
+transaction-owned captures; successful recovery removes orphaned captures.
 
 A persistent named resource composes as:
 
@@ -34,6 +35,20 @@ Cluster<Service>
 No layer may duplicate an adjacent owner's route, transaction lifecycle, log,
 or recovery policy.
 
+Every application mutation of a persistent mutable collection must pass through
+its owning Chain. Returned views grant read access, not mutation authority.
+Chain records accepted mutations and owns their durable recovery; collections
+apply local transactional changes. Full reads, slices, and transformed views
+cannot expose or regain the mutable subject. Selection-write conveniences send
+PUT/DELETE to the original owner with explicit bounds, rather than mutating a
+returned alias. POST composes those owner-bound operations.
+
+Creation transfers exclusive ownership of an unpublished subject to Chain.
+Trusted native callers must relinquish mutable aliases and must not independently
+reopen its storage. This contract adds no runtime alias-revocation mechanism.
+Fresh request-local collections and explicit independent copies remain writable;
+they do not grant write access to the source.
+
 Collection concurrency and WAL coordination are separate concerns. Chain records
 requests and coordinates their complete capture with commit, durable publication,
 and reclamation. It does not schedule collection mutations or determine which
@@ -41,15 +56,16 @@ keys, rows, ranges, or transactions conflict. Those decisions belong to the
 transactional collection and its locking primitives. Ordering records for replay
 does not require globally serializing execution of collection handlers.
 
-SyncChain is the sole durable transaction authority until finalization. Collection
-has no acceptance manifest or independent durable transaction ledger. Transaction
-workspaces retain committed deltas until successful recursive finalization.
+Collection owns immutable native versions, acceptance receipts, and atomic cutoff
+publication. These describe local storage, not a second request WAL or transaction
+coordinator. Chain owns ordered request history and replay across the WAL-to-native
+handoff; it does not synchronize collection internals.
 
 ## Common behavior
 
 An ordinary mutation produces pending transactional work. A successful Chain
-commit acknowledges both durable recovery evidence and completed logical
-visibility in its collection. Canonical materialization may follow later; it is
+commit acknowledges both durable recovery evidence and completed durable
+publication and visibility in its collection. Canonical materialization may follow later; it is
 not required for commit acknowledgement when retained history can recover the
 committed effects.
 
@@ -59,8 +75,8 @@ deterministically, and materializes state by delegating to its collection.
 SyncChain recovers by replaying its retained request WAL against its persistent subject. A
 retained-history variant may instead make complete history authoritative.
 
-Recovery replays only the complete validated history required by its variant. Missing,
-conflicting, corrupt, or unverifiable history fails closed. Chain policy selects
+Recovery validates the history required by its variant before applying each mutation.
+Missing referenced data, conflicting, corrupt, or unverifiable history fails closed. Chain policy selects
 canonical history and coordinates replacement; collections and hosts do not
 guess, vote, truncate, or locally repair it.
 
@@ -72,7 +88,7 @@ lifecycle.
 ## Variants
 
 - `SyncChain` supplies the minimal ordered history and replay required to
-  synchronize a mutable BTree or Table subject. Its WAL is temporary, and its
+  synchronize a mutable BTree, Table, or Tensor subject. Its WAL is temporary, and its
   persistent subject holds mutations already removed from the WAL.
 - `BlockChain` adds cryptographic predecessor/evidence validation to the common
   ordered history.
@@ -94,9 +110,10 @@ read-only. POST composes writes through the owning resource's PUT/DELETE boundar
 it may not mutate storage directly. The proposed MetricsChain exception to GET
 read-only behavior is not implemented.
 
-The caller delegates a fresh bounded `TxnTaskQueue<MutationRecord>` to one Chain.
+The caller supplies a positive per-transaction mutation capacity. Each Chain
+constructs its own bounded queue.
 The queue owns pending records, admission, live transaction decisions, and WAL
-preparation/lifecycle exclusion; the persisted committed block owns durable history.
+admission/lifecycle exclusion; immutable transaction files own durable history.
 Queue decision receipts are not a second durable history: publication alone does
 not prove completion of subject commit. Historical replay initializes receipts
 without consuming pending-task capacity.
@@ -106,100 +123,113 @@ registering pending work. A previously unseen transaction may commit or roll bac
 the queue then retains its decision receipt until finalization. Read-only decisions
 delegate to the subject without publishing mutation records.
 
-Scalar mutations are admitted and captured in memory. Collection-valued arguments
-are captured by native streamed collection copying to retain their value
-at invocation. Neither path creates a detached task. A failed or cancelled
-mutation prevents that transaction from committing; it may be discarded by
-rollback or cutoff finalization.
-The caller-held task permit reserves capacity before capture, records the request
-before invoking the selected handler, and requires explicit successful completion.
-Recording releases preparation exclusion before collection execution. The queue's
-`Running` status identifies unfinished requests; completion restores `Active`,
-and unfinished drop marks `Failed`. Chain keeps no separate execution token.
-The queue's internal mutex is never held across callbacks or awaits. Armed lifecycle
-permits latch interruption for all live clones; resource shutdown and recovery
-remain caller policy.
+Every collection argument delegates to `CopyFrom::copy_from` directly into
+`values/<original-txn-id>/<capture-id>`. The storage owner supplies a unique
+capture ID; it has no ordering meaning. Materialization creates independent
+native storage and preserves logical ordering. The local capture digest includes
+collection class, the native reopening descriptor, and contents. Replica state
+comparison uses the Collection's logical digest. Capture
+returns the retained native value together with its stored description; the
+selected handler applies that value, including exact floating-point results.
+There is no cross-transaction capture sharing, second copy, or live reload.
+Scalar arguments remain native scalar data, including ordinary scalar references;
+references in scalar data are never interpreted as capture descriptions.
 
-Commit synchronizes each distinct capture, atomically publishes the ordered
-requests, delegates Collection's in-memory commit, then acknowledges. Requests
-remain in the WAL. Empty and duplicate commits and rollback perform no WAL writes;
-their live receipts are not a durable historical decision ledger. Publication
-followed by failed or cancelled subject commit requires reopening, never an inferred
-rollback. Armed lifecycle interruption makes the live owner unusable.
+Admission reserves queue capacity and marks the transaction `Running` before any
+capture allocation. Its short lifecycle exclusion ends before source evaluation,
+so capture may await earlier collection decisions without blocking them. Within
+one transaction, another unfinished task is rejected. Recording occurs exactly once before the
+selected mutation executes. Completion restores `Active`; unfinished drop marks
+`Failed`. Chain adds no mirrored execution status or detached work.
 
-Finalization derives covered mutations from retained requests. When any are covered,
-it durably publishes materialization intent before native writes, delegates in-place
-Collection finalization, durably synchronizes canonical storage, then atomically
-advances the cutoff, clears intent, and removes covered requests. Only then does it
-finalize queue receipts. With no covered mutations it delegates logical cutoff
-cleanup and publishes the frontier without intent or canonical synchronization.
-Duplicate cutoffs perform no durable writes. Finalization is durability-critical
-but does not determine commitment. It does not serialize the whole subject.
+Commit synchronizes the transaction's captures, durably publishes its immutable
+`<full-txn-id>.chain_block` file, delegates Collection's durable commit, then
+acknowledges. The file retains the original ID and ordered records. It never
+rewrites another transaction's history. Existing publication conflicts fail rather
+than overwrite. Read-only and duplicate commits publish no files. Publication
+followed by failed or cancelled subject commit requires reopening, never inferred
+rollback. Armed lifecycle interruption makes every live clone unusable.
 
-Rollback and finalization leave unused captures until successful reopening. Storage
-admission continues to apply; there is no automatic expansion or fallback.
+Rollback delegates Collection rollback, removes that transaction's captures,
+durably synchronizes removal, and then completes the queue decision. Finalization
+checks covered tasks and records, delegates durable Collection finalization,
+publishes the Chain frontier, and deletes covered transaction files and capture
+directories. Only successful cleanup completes queue finalization. A restart
+between native and Chain frontier publication is safe: native recovery recognizes
+the accepted IDs or cutoff. Duplicate cutoffs perform no durable writes. Later
+transactions own independent captures and survive earlier cutoff cleanup.
 
-Creation receives an unpublished persistent subject, empty delegated WAL storage,
-and empty delegated collection-value storage. It synchronizes that initial subject
-before publishing the empty committed block.
-Loading receives an asynchronous subject loader and requires the committed file,
-a valid SHA-256 file checksum, a null predecessor, unique transaction entries,
-and nonempty records for every transaction strictly beyond the finalized frontier.
-Transactions retain their original IDs. Collection values use native scoped GET
-references whose ID is the hexadecimal SHA-256 identity, suffix is the collection
-class path, and key is the native schema.
-Identity combines the hash of class and semantic schema with the hash of ordered
-contents; native collection copying, loading, and hashing belong to the collection
-owner. Chain validates all records and captures before requesting replay capabilities.
-Every retained ID replays ordinary PUT/DELETE or native restoration and commits
-Collection visibility. Capabilities must preserve original IDs; an ID mismatch
-fails. Recovery retains requests and reconstructs only mutating commit receipts
-and the finalized cutoff. Unreferenced captured files can be
-reclaimed only after successful recovery. Missing subject roots or required files are
-errors at the collection/storage boundary, never instructions to create state.
+Creation requires an already constructed unpublished persistent subject, empty
+delegated WAL and capture roots, and a fresh queue. It publishes
+`committed.chain_block`; Collection construction owns initial native durability.
+Recovery validates each transaction file before invoking Collection's recovery
+operation. Only missing native decisions request an original-ID replay capability
+and verify/load their captures before mutation. Filenames must be canonical full
+transaction IDs and agree with their payloads; records are nonempty and captures
+resolve only within their original transaction. Replay orders parsed transaction
+IDs, never filename strings.
+
+Files at or below a durably published frontier are obsolete cleanup residue;
+they are removed after successful recovery without decoding or replay. Capture
+directories without a retained transaction record are also removed then. A missing
+capture required for replay or an observed corrupt, conflicting, or unverifiable file fails recovery. Required native
+storage is strictly loaded, never recreated. Recovery retains accepted history
+and reconstructs mutating decision receipts without pending-task capacity.
 
 `restore_from(&txn, &snapshot)` records a captured collection reference and
 delegates native transactional restoration. Kind and semantic schema must match.
 It adds no public restoration route or network fetching.
-Native views retain v1 behavior: mutations through escaped raw collection
-handles are outside the WAL's coverage.
+Returned native views reject mutations and cannot drive the source's lifecycle.
+Replay and canonical finalization remain internal applications of accepted
+history; they do not create another application mutation path.
 
 The caller owns persistent subject storage, durable WAL storage, and transaction
 allocation contexts. Chain delegates cache, file-handle, and disk-reserve admission
 to storage. It adds no transaction-count, mutation-count, or retained-byte quota.
-History uses a shared `ChainBlock`: a 32-byte predecessor field and an ordered
-map from original transaction IDs to ordered mutation records. Its format-neutral
-codec encodes `(previous_hash, mutations)`. DELETE encodes `(path, key)` and PUT
-encodes `(path, key, stored_value)`; a scalar null remains an ordinary PUT value.
-Native restoration encodes `(stored_collection_reference,)`.
-Duplicate transaction IDs and malformed records are rejected.
+The format-neutral `ChainFile` codec distinguishes two data alternatives:
+`("frontier", finalized_cutoff)` in
+`committed.chain_block`, and `("transaction", original_id, ordered_records)` in
+`<full-txn-id>.chain_block`.
+PUT encodes `("put", path, key, stored_value)`, DELETE encodes
+`("delete", path, key)`, and restoration encodes `("restore", capture)`.
+Stored values are `("scalar", scalar)` or `("collection", capture)`; a capture
+contains `(capture_id, collection_class_path, native_schema, capture_digest)`.
+Null is ordinary scalar data. Native schema conversion belongs to Collection;
+mutation paths use `pathlink::PathBuf`. Unknown tags, malformed fields, and
+incorrect arity fail decoding. SyncChain has no speculative predecessor field;
+BlockChain semantics remain unimplemented.
 
-SyncChain keeps one `committed.chain_block` file encoding
-`(finalized_cutoff, materializing_cutoff, ChainBlock)`. The optional materializing
-cutoff records an unfinished canonical update. Chain rejects retained requests
-at or below the finalized cutoff. SyncChain requires the null predecessor
-(32 zero bytes); the shared codec also supports nonzero predecessors.
-BlockChain predecessor validation and retention policy remain unimplemented.
-There is no publication index, per-transaction file, or format-version field.
-Atomic durable replacement publishes the entire retained request history.
-Collection arguments occupy their separate native storage root.
-The cache retains semantic mutation records, not encoded chunks. File codecs
-own JSON encoding and SHA-256 framing. These file checksums protect
-encoded storage; they are not semantic BlockChain hashes. Collection identities
-include semantic schema and contents, excluding cache configuration and physical
-layout. Semantic BlockChain hashing remains unimplemented;
-encoded JSON and file checksums must not substitute for it.
-Measurement and persistence borrow semantic records through their native codecs;
-publication still prepares an independent replacement snapshot.
-The storage boundary measures
-encoded file size for cache admission before persistence; mutation routing performs
-no measurement encoding. Collection values occupy native collection storage and
-are synchronized without re-encoding or copying them at commit.
-Each mutating commit rewrites all retained records. The retained block must fit
-the delegated cache's per-file admission bound, including replacement headroom.
-Requests are retained until finalization; there is no automatic
-rotation, alternate layout, or background flushing. Fewer files and publication operations do not
-imply less cumulative write traffic.
+The cache retains semantic records, not encoded chunks. File codecs select JSON
+and SHA-256 checksum framing at the storage boundary. Checksums protect encoded
+files; they are not semantic collection or BlockChain hashes. Each transaction
+file must fit the delegated per-file admission bound. Total live files are bounded
+by caller-owned transaction admission and timely expiry/finalization. An ordered
+recovery index contains file handles, never a second retained history payload.
+Cutoff finalization prepares only covered transaction identities, without sorting
+or retaining handles for later history. Recovery and finalization share native
+entry validation. Capture cleanup walks the delegated directory without a
+second retained reference index.
+Persistence borrows records. `GetSize` accounts actual retained container capacity;
+before executing each selected mutation, Chain admits the complete pending
+transaction's native record payload and vector capacity against that same
+per-file bound, including the delegated file composition's inline envelope and
+the shared vector container used after publication.
+Recording charges actual vector capacity and grows within the admitted bound;
+it does not repeatedly compact earlier records. Completed decoding compacts
+containers once, preserving native scalar variants and allowing an admitted
+batch to reopen under the same native memory budget. Encoded file length is a
+separate quantity; application manifest and module byte limits do not apply to
+native history files.
+Published transaction records are shared immutably between the cache and replay.
+Replay releases its file guard before capability acquisition and native work,
+retains one shared transaction vector, and clones only the selected record for
+its consuming invocation. Cache eviction does not invalidate that snapshot.
+Predictable oversize rejects the task before its mutation, preserving ordinary
+caller-owned rollback. Cache contention and storage failures remain fallible at
+commit; admission does not reserve residency or disk space.
+Decoding and construction may allocate before admission. Cache residency is not a
+process-wide memory ceiling. Collections stream materialization, hashing, loading,
+and native mutation; commit synchronizes existing captures without copying them.
 
 Collection handlers in different transactions may execute concurrently. Earlier
 pending records do not exclude later requests; collections decide which mutations
@@ -208,26 +238,22 @@ the prior one finishes, preserving the same request order in execution and repla
 Commit/rollback reject unfinished work in their transaction; finalization rejects
 unfinished work through its cutoff. Later executing requests do not exclude an
 earlier decision. These checks cover intercepted mutation tasks, not observations
-or escaped native handles and streams. The caller must prevent new work and finish
-or cancel affected operations and release their streams before a lifecycle
-decision, as required by the collection contract. Native collection lifecycle
-errors still propagate.
+or retained read-only values and streams. Before commit, the caller prevents new
+mutations and finishes mutating operations in that transaction. Immutable result
+snapshots and their streams may survive commit. Before rollback, the caller
+finishes or cancels all affected operations and releases their streams and guards;
+before finalization, this applies to transactions through the cutoff. These are
+caller-owned preconditions from the collection contract, not additional Chain
+read tracking. Native collection lifecycle errors still propagate.
 
-Capture and lifecycle preparation remain exclusive. Capture exclusion prevents
-reuse of an incompletely copied argument; live lifecycle methods do not reclaim
-captures. Admission awaits the queue's semaphore rather than returning a conflict
-for ordinary publication contention. Waiting registers no work; interruption of
-an armed lifecycle closes the semaphore and requires reopening. This exclusion ends before the selected
-collection handler executes. It is WAL storage coordination, not collection
-conflict detection. Publication and interruption protection remain unchanged.
-A further v1 integration port must address native collection copying and
-transactional directory ownership together. Removing capture exclusion requires
-demonstrated incomplete-copy isolation, not an assumed filesystem capability.
-Reads retain collection ordering. Calls inherit cancellation
-and the caller's absolute deadline. There is no background flusher or group-commit
-queue. Lifecycle calls use the shared fallible `Transact` trait; finalization
-needs only the caller's cutoff ID. The local persisted cutoff is not another
-transaction allocator or host finalized-frontier authority.
+Admission and lifecycle decisions share one queue semaphore. Waiting admission
+registers no work and inherits the caller's deadline. Capture and selected handler
+execution retain their task, not the semaphore. Transaction-owned directories
+isolate incomplete captures; failed or cancelled work cannot publish a transaction.
+Lifecycle exclusion prevents new admission while a decision or cleanup runs, and
+covered unfinished tasks reject the decision. Armed interruption closes the
+semaphore and requires reopening. Reads retain collection ordering. There is no
+background flusher, group-commit queue, or additional transaction allocator.
 
 `SyncChain::hash` validates the caller's transaction as an observation, then
 delegates to the subject's native hash of class, semantic schema, and visible
@@ -235,15 +261,18 @@ contents. It does not register pending work or hash the WAL representation.
 
 ### Recovery boundary
 
-Loading validates the WAL before invoking the subject loader. Any materialization
-intent returns a recovery-required error without native loading, capabilities,
-replay, or reclamation, even if canonical storage appears structurally valid.
-With a clean record, strict native loading validates tree structure and Table index
-consistency; all retained requests and captures are validated before capabilities
-are requested. Collection and queue cutoffs are initialized from the WAL. Every
-retained transaction is replayed in original order into fresh caller-delegated
-workspaces with its original ID, then committed in memory. Recovery retains the WAL.
-Only successful recovery permits orphaned capture cleanup.
+Opening validates the frontier before invoking the strict native subject loader.
+Collection loading reconstructs durable native visibility and cutoff. Recovery
+makes one ordered pass over retained transaction files, validating each required
+file before delegating `Collection::recover`. A native accepted decision skips
+replay and capability acquisition. A missing decision is replayed with its
+original-ID capability and durably committed before processing the next record.
+Collection and queue cutoffs are initialized from the WAL; a newer native cutoff
+is safe when its Chain publication was interrupted. Recovery retains the WAL.
+Only successful recovery permits orphaned capture cleanup. A late failure can
+leave earlier accepted records durably completed in native storage. The owner
+remains unpublished and interrupted; reopening recognizes those decisions and
+continues without reapplying them.
 
 Callers which must assemble an execution runtime before replay use `open` followed
 by `recover`. The opened owner remains unpublished: no requests, expiry processing,
@@ -252,30 +281,33 @@ these same operations. Native invocation is generic over the caller's State;
 the delegated WAL file composition implements `ChainFileType`. Chain owns the
 record codec and checksum framing regardless of that composition.
 
-Interrupted in-place materialization cannot be repaired by ordinary request replay
-or native restoration. The resource remains unavailable. Future Service/Cluster
-integration must select authoritative state using authenticated resource membership
-and appropriate history/checkpoint evidence, construct a replacement in fresh
-storage, and retain old evidence until replacement is durable. A reachable peer
-alone is not authority. Libraries return errors; the host owns readiness withdrawal
-or shutdown. Chain is not a cross-service transaction coordinator.
+Interrupted native commit or compaction recovers through immutable payloads and
+atomic descriptors. Missing referenced or corrupt storage still fails closed.
+Automatic authoritative replacement remains unsupported: future Service/Cluster
+integration must select authenticated canonical state and construct a replacement
+in fresh storage, retaining evidence until publication is durable. Libraries
+return errors; the host owns readiness withdrawal or shutdown. Chain is not a
+cross-service transaction coordinator.
 
-Restart fixtures are not physical power-loss validation. Durability assumes the
-filesystem honors atomic replacement and file/directory synchronization.
+Chain and its integrating host exclusively own the delegated storage. Durability
+covers interruption of their operations and assumes the filesystem honors atomic
+replacement and file/directory synchronization. Checksums and strict loading detect
+observed inconsistencies and missing referenced data; they do not establish that
+no complete transaction file was externally removed or that storage was not
+externally rolled back. There is no independent inventory for detecting those
+out-of-process changes. Restart fixtures are not physical power-loss validation.
 
-The WAL stores ordinary Scalars directly, reserving top-level scalar references
-for captured collections. Other reference forms are rejected. The value store
-strictly loads and verifies existing identities before reuse; multiple requests
-may share one capture. Load-time reclamation preserves every published capture. Resolution
-never evaluates references through routing or the network.
-The native copy must reproduce the source's ordered-content hash. Reordered views
-whose order is lost during copying fail closed; this format does not preserve view
-ordering or implement order canonicalization.
+History resolution strictly loads native captures and verifies their integrity
+digests; it never evaluates scalar references through routing or the network.
+Capture delegates independent native construction to Collection's `CopyFrom`
+implementation. Earlier unpublished
+layouts are rejected; development fixtures must be recreated. There is no
+compatibility reader or migration.
 
-The format uses shared semantic blocks and structural mutation records, records
-publication through one atomic committed-file replacement, and delegates mutation-route encoding and validation
-to `pathlink::PathBuf`. Earlier unpublished formats are unsupported.
-Development fixtures must be recreated; there is no compatibility reader or migration.
+Native collection ordering refines complete collation ties without changing
+range equivalence. Strict capture loading rejects noncanonical native tie order;
+Chain delegates ordering and validation to Collection. Correcting previously
+incomplete or lifecycle-dependent tied-row results can change their digests.
 
 ## Failure and resource semantics
 
@@ -292,8 +324,9 @@ Development fixtures must be recreated; there is no compatibility reader or migr
   records fail loading instead of being skipped.
 - Reconciliation is externally coordinated and never hidden behind host startup,
   HTTP replication, `txfs`, collection storage, or a process-global registry.
-- The three-second synchronous budget still applies; longer workflows use the
-  canonical persistent `While` queue.
+- The caller supplies execution deadlines and budgets. `While` executes within
+  its request; Chain does not automatically queue long-running workflows or split
+  them into transactions.
 
 ## Promotion criteria
 
@@ -302,9 +335,9 @@ duplicate delivery, gaps, conflicts, restart replay, corrupt history,
 backpressure, cancellation, materialization, and resynchronization through the
 same Service and Cluster path.
 
-Crate-level SyncChain support covers BTree and Table recovery and failure boundaries.
-Executable Services, host readiness, and authenticated snapshot transport belong
-to the integrating host. This crate exposes generic native State/file delegation,
-unpublished opening followed by recovery, and transactional restoration for those
-owners. Automatic authoritative replacement of damaged storage and persistent
-Tensor subjects remain unsupported.
+Crate-level SyncChain support covers BTree, Table, and Tensor recovery and failure
+boundaries. Executable Services, host readiness, and authenticated snapshot transport
+belong to the integrating host. This crate exposes generic native State/file
+delegation, unpublished opening followed by recovery, and transactional restoration
+for those owners. Automatic authoritative replacement of damaged storage remains
+unsupported.
