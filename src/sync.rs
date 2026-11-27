@@ -3,21 +3,35 @@ use std::sync::Arc;
 use freqfs::DirLock;
 use pathlink::PathBuf;
 use safecast::TryCastInto;
-use tc_collection::{Collection, CollectionState, StorageContext};
+use tc_collection::{Collection, CollectionState, Restore, StorageContext};
 use tc_error::{TCError, TCResult};
 use tc_ir::{IntoView, Public, Scalar, Sha256Hash, Transact, TxnId};
+use txn_lock::queue::task::TaskQueue;
 
-use crate::TxnTaskQueue;
 use crate::storage::{self, ChainFile, ChainFileType, MutationRecord, Store};
+
+fn pending(capacity: usize) -> TCResult<TaskQueue<TxnId, MutationRecord>> {
+    if capacity == 0 {
+        return Err(TCError::bad_request(
+            "Chain mutation capacity must be positive",
+        ));
+    }
+
+    Ok(TaskQueue::new(capacity))
+}
 
 pub(crate) struct Inner<Txn: StorageContext, FE> {
     pub(crate) subject: Collection<Txn>,
     store: Store<Txn, FE>,
-    queue: TxnTaskQueue<MutationRecord>,
+    queue: TaskQueue<TxnId, MutationRecord>,
+    // Immutable admission configuration, computed where the file composition is
+    // known. Native routing need not know how the host persists that composition.
+    record_capacity: usize,
 }
 
-/// A v1-style request WAL around a native persistent collection.
-/// Escaped native collection handles remain outside this log's coverage.
+/// A durable request WAL around a native persistent collection.
+/// Application mutations enter through this owner; returned collection views
+/// are read-only. Callers relinquish mutable aliases when handing over the subject.
 pub struct SyncChain<Txn: StorageContext, FE = ChainFile> {
     pub(crate) inner: Arc<Inner<Txn, FE>>,
 }
@@ -31,27 +45,42 @@ impl<Txn: StorageContext, FE> Clone for SyncChain<Txn, FE> {
 }
 
 impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
-    fn new(
+    async fn new(
         subject: Collection<Txn>,
         store: Store<Txn, FE>,
-        queue: TxnTaskQueue<MutationRecord>,
+        queue: TaskQueue<TxnId, MutationRecord>,
     ) -> Self {
+        let record_capacity = store
+            .root
+            .read()
+            .await
+            .max_file_size()
+            .saturating_sub(FE::from(ChainFile::default()).get_size())
+            // Immutable replay snapshots share the Vec allocation with the cache.
+            // Its container lives in the Arc, outside the file's inline envelope.
+            .saturating_sub(std::mem::size_of::<Vec<MutationRecord>>());
+
         Self {
             inner: Arc::new(Inner {
                 subject,
                 store,
                 queue,
+                record_capacity,
             }),
         }
     }
 
     /// Publish an empty WAL around an unpublished canonical subject.
+    /// The caller durably establishes the delegated WAL and capture roots.
+    /// The caller transfers exclusive mutation and lifecycle ownership. Retained
+    /// mutable aliases must not be used, and storage must not be reopened independently.
     pub async fn create(
         subject: Collection<Txn>,
         root: DirLock<FE>,
         values: DirLock<Txn::File>,
-        queue: TxnTaskQueue<MutationRecord>,
+        capacity: usize,
     ) -> TCResult<Self> {
+        let queue = pending(capacity)?;
         if !subject.is_persistent() {
             return Err(TCError::bad_request(
                 "SyncChain requires a persistent collection owner",
@@ -61,73 +90,43 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
             return Err(TCError::bad_request("creation requires empty WAL storage"));
         }
 
-        queue.validate_fresh()?;
         let mut operation = queue.operation().await?;
         operation.arm();
-        subject.sync_all().await?;
-        let committed = storage::create(&root).await?;
+        let committed = root
+            .write()
+            .await
+            .create_file::<FE>(storage::COMMITTED.into(), FE::from(ChainFile::default()))
+            .await?;
+
+        committed.sync_all().await?;
         operation.complete();
-        Ok(Self::new(subject, Store { committed, values }, queue))
+        Ok(Self::new(subject, Store { root, values }, queue).await)
     }
 
-    /// Check the WAL before invoking the caller's strict native subject loader.
-    /// Replay retained requests using original identities and fresh workspaces.
-    /// Unfinished materialization requires authoritative resynchronization;
-    /// no native loader, replay capability, or cleanup is invoked in that case.
+    /// Check the frontier before invoking the caller's strict native subject loader.
+    /// The returned owner must remain unpublished until recovery succeeds.
     pub async fn open<L, Loaded>(
         subject: L,
         root: DirLock<FE>,
         values: DirLock<Txn::File>,
-        queue: TxnTaskQueue<MutationRecord>,
+        capacity: usize,
     ) -> TCResult<Self>
     where
         L: FnOnce() -> Loaded,
         Loaded: std::future::Future<Output = TCResult<Collection<Txn>>>,
     {
-        queue.validate_fresh()?;
-        let file = storage::load(&root).await?;
-        let committed = file.read::<ChainFile>().await?.clone();
-        if committed.materializing.is_some() {
-            return Err(TCError::bad_request(
-                "recovery required: unfinished canonical materialization; authoritative resynchronization is required",
-            ));
-        }
-        if committed.block.previous_hash != tc_ir::Sha256Hash::default() {
-            return Err(TCError::bad_request("invalid SyncChain predecessor"));
-        }
-        if committed.block.mutations.iter().any(|(id, records)| {
-            committed.finalized.is_some_and(|frontier| *id <= frontier) || records.is_empty()
-        }) {
-            return Err(TCError::bad_request("conflicting or empty WAL transaction"));
-        }
+        let queue = pending(capacity)?;
+        let store = Store { root, values };
+        store.frontier().await?;
+
         let subject = subject().await?;
         if !subject.is_persistent() {
             return Err(TCError::bad_request(
                 "SyncChain requires a persistent collection owner",
             ));
         }
-        let chain = Self::new(
-            subject,
-            Store {
-                committed: file,
-                values,
-            },
-            queue,
-        );
-        // Validate every record and stored collection before invoking any mutation handler.
-        for (id, records) in &committed.block.mutations {
-            for value in records.iter().filter_map(MutationRecord::value) {
-                if storage::reference(value)?.is_some() {
-                    chain
-                        .inner
-                        .store
-                        .resolve_collection(*id, value.clone())
-                        .await?;
-                }
-            }
-        }
 
-        Ok(chain)
+        Ok(Self::new(subject, store, queue).await)
     }
 
     /// Replay an opened, unpublished owner after the caller has assembled its runtime.
@@ -135,65 +134,77 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
     pub async fn recover<S, F, Fut>(&self, mut transaction: F) -> TCResult<()>
     where
         S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
-        F: FnMut(TxnId) -> Fut,
-        Fut: std::future::Future<Output = TCResult<Txn>>,
+        F: FnMut(TxnId) -> Fut + Send,
+        Fut: std::future::Future<Output = TCResult<Txn>> + Send,
     {
         self.inner.queue.validate_fresh()?;
-        let committed = self
-            .inner
-            .store
-            .committed
-            .read::<ChainFile>()
-            .await?
-            .clone();
+        let finalized = self.inner.store.frontier().await?;
         let mut operation = self.inner.queue.operation().await?;
         operation.arm();
-        if let Some(frontier) = committed.finalized {
+        if let Some(frontier) = finalized {
             self.inner.subject.finalize(&frontier).await?;
             operation.finalize(frontier)?;
         }
 
-        for (id, records) in committed.block.mutations {
-            let txn = transaction(id).await?;
-            if txn.id() != id {
-                return Err(TCError::bad_request(
-                    "recovery transaction identity mismatch",
-                ));
+        let transactions = self.inner.store.transactions().await?;
+        for (&id, file) in &transactions {
+            if finalized.is_some_and(|frontier| id <= frontier) {
+                continue;
             }
 
-            for record in records {
-                match record {
-                    MutationRecord::Restore(value) => {
-                        let snapshot = self.inner.store.resolve_collection(id, value).await?;
-                        self.inner.subject.restore_from(&txn, &snapshot).await?;
+            // Release the WAL guard before native storage or capability acquisition.
+            // Replay independently retains the immutable payload after releasing
+            // its WAL guard. Clone only the selected record when invocation consumes it.
+            let records = { file.read::<ChainFile>().await?.records(id)?.clone() };
+            self.inner
+                .subject
+                .recover(id, || async {
+                    let txn = transaction(id).await?;
+                    if txn.id() != id {
+                        return Err(TCError::bad_request(
+                            "recovery transaction identity mismatch",
+                        ));
                     }
-                    MutationRecord::Put(path, key, value) => {
-                        self.inner
-                            .subject
-                            .put(
-                                &txn,
-                                &path,
-                                key,
-                                self.inner.store.resolve::<S>(id, value).await?,
-                            )
-                            .await?
+
+                    for record in records.iter().cloned() {
+                        match record {
+                            MutationRecord::Restore(value) => {
+                                let snapshot =
+                                    self.inner.store.resolve_collection(id, &value).await?;
+
+                                self.inner.subject.restore(&txn, &snapshot).await?;
+                            }
+                            MutationRecord::Put(path, key, value) => {
+                                self.inner
+                                    .subject
+                                    .put(
+                                        &txn,
+                                        &path,
+                                        key,
+                                        self.inner.store.resolve::<S>(id, *value).await?,
+                                    )
+                                    .await?
+                            }
+                            MutationRecord::Delete(path, key) => {
+                                <Collection<Txn> as Public<S>>::delete(
+                                    &self.inner.subject,
+                                    &txn,
+                                    &path,
+                                    key,
+                                )
+                                .await?
+                            }
+                        }
                     }
-                    MutationRecord::Delete(path, key) => {
-                        <Collection<Txn> as Public<S>>::delete(
-                            &self.inner.subject,
-                            &txn,
-                            &path,
-                            key,
-                        )
-                        .await?
-                    }
-                }
-            }
-            self.inner.subject.commit(id).await?;
+
+                    Ok(())
+                })
+                .await?;
+
             operation.commit(&id)?;
         }
 
-        self.inner.store.reclaim().await?;
+        self.inner.store.reclaim(finalized, &transactions).await?;
         operation.complete();
         Ok(())
     }
@@ -203,19 +214,18 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> SyncChain<Txn, FE> {
         subject: L,
         root: DirLock<FE>,
         values: DirLock<Txn::File>,
-        queue: TxnTaskQueue<MutationRecord>,
+        capacity: usize,
         transaction: F,
     ) -> TCResult<Self>
     where
         S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
         L: FnOnce() -> Loaded,
         Loaded: std::future::Future<Output = TCResult<Collection<Txn>>>,
-        F: FnMut(TxnId) -> Fut,
-        Fut: std::future::Future<Output = TCResult<Txn>>,
+        F: FnMut(TxnId) -> Fut + Send,
+        Fut: std::future::Future<Output = TCResult<Txn>> + Send,
     {
-        let chain = Self::open(subject, root.clone(), values, queue).await?;
+        let chain = Self::open(subject, root, values, capacity).await?;
         chain.recover::<S, _, _>(transaction).await?;
-        root.sync_deleted().await?;
         Ok(chain)
     }
 }
@@ -224,24 +234,19 @@ impl<Txn: StorageContext + 'static, FE: Send + Sync> SyncChain<Txn, FE> {
     /// Record and stage a native replacement using a caller-supplied snapshot.
     pub async fn restore_from(&self, txn: &Txn, snapshot: &Collection<Txn>) -> TCResult<()> {
         let mut task = self.inner.queue.start(txn.id()).await?;
-        let reference = self
+        let (reference, captured) = self
             .inner
             .store
             .capture_collection(txn, snapshot.clone())
             .await?;
-        let captured = self
-            .inner
-            .store
-            .resolve_collection(txn.id(), reference.clone())
-            .await?;
-        task.record(MutationRecord::Restore(reference))?;
-        self.inner.subject.restore_from(txn, &captured).await?;
-        task.complete().map_err(Into::into)
-    }
 
-    /// Admit a caller-owned transaction without allocating an identity.
-    pub fn register(&self, txn: Txn) -> TCResult<()> {
-        self.inner.queue.register(txn.id()).map_err(Into::into)
+        task.record_bounded(
+            MutationRecord::Restore(reference),
+            self.inner.record_capacity,
+        )?;
+
+        self.inner.subject.restore(txn, &captured).await?;
+        task.complete().map_err(Into::into)
     }
 
     /// Hash the transaction-visible subject, including its class, schema, and contents.
@@ -254,29 +259,50 @@ impl<Txn: StorageContext + 'static, FE: Send + Sync> SyncChain<Txn, FE> {
         self.inner.queue.readable(txn.id()).map_err(Into::into)
     }
 
-    pub(crate) async fn mutate<S, F, Fut>(
+    pub(crate) async fn put_recorded<S, F, Fut>(
         &self,
         txn: &Txn,
         path: PathBuf,
         key: Scalar,
-        value: Option<S>,
+        value: S,
         selected: F,
     ) -> TCResult<()>
     where
         S: CollectionState<Txn = Txn> + TryCastInto<Collection<Txn>>,
-        F: FnOnce() -> Fut + Send,
+        F: FnOnce(S) -> Fut + Send,
         Fut: std::future::Future<Output = TCResult<()>> + Send,
     {
         let mut task = self.inner.queue.start(txn.id()).await?;
 
-        let record = match value {
-            Some(value) => {
-                MutationRecord::Put(path, key, self.inner.store.capture(txn, value).await?)
-            }
-            None => MutationRecord::Delete(path, key),
-        };
+        let (value, accepted) = self.inner.store.capture(txn, value).await?;
+        task.record_bounded(
+            MutationRecord::Put(path, key, Box::new(value)),
+            self.inner.record_capacity,
+        )?;
 
-        task.record(record)?;
+        // Apply the same native values retained for replay, including the exact
+        // materialization of a lazy floating-point Tensor input.
+        selected(accepted).await?;
+        task.complete().map_err(Into::into)
+    }
+
+    pub(crate) async fn delete_recorded<F, Fut>(
+        &self,
+        txn: &Txn,
+        path: PathBuf,
+        key: Scalar,
+        selected: F,
+    ) -> TCResult<()>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = TCResult<()>> + Send,
+    {
+        let mut task = self.inner.queue.start(txn.id()).await?;
+        task.record_bounded(
+            MutationRecord::Delete(path, key),
+            self.inner.record_capacity,
+        )?;
+
         selected().await?;
         task.complete().map_err(Into::into)
     }
@@ -284,6 +310,7 @@ impl<Txn: StorageContext + 'static, FE: Send + Sync> SyncChain<Txn, FE> {
 
 impl<Txn: StorageContext + 'static, FE: Send + Sync> IntoView for SyncChain<Txn, FE> {
     type Txn = Txn;
+
     type View = tc_collection::CollectionView;
 
     async fn into_view(self, txn: Txn) -> TCResult<Self::View> {
@@ -298,20 +325,10 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Tx
         let Some(records) = operation.commit(&id)? else {
             return Ok(());
         };
-        if !records.is_empty() {
-            let mut committed = self
-                .inner
-                .store
-                .committed
-                .read::<ChainFile>()
-                .await?
-                .clone();
-            self.inner.store.sync(&records).await?;
-            if committed.block.mutations.insert(id, records).is_some() {
-                return Err(TCError::conflict("transaction already published"));
-            }
 
-            storage::publish(&self.inner.store.committed, committed).await?;
+        if !records.is_empty() {
+            self.inner.store.sync_captures(&records).await?;
+            self.inner.store.publish_transaction(id, records).await?;
         }
 
         self.inner.subject.commit(id).await?;
@@ -327,6 +344,7 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Tx
 
         operation.arm();
         self.inner.subject.rollback(id).await?;
+        self.inner.store.remove_captures(*id).await?;
         operation.rollback(id)?;
         operation.complete();
         Ok(())
@@ -335,28 +353,20 @@ impl<Txn: StorageContext + 'static, FE: ChainFileType> Transact for SyncChain<Tx
     async fn finalize(&self, cutoff: &TxnId) -> TCResult<()> {
         let mut operation = self.inner.queue.operation().await?;
         operation.check_finalize(cutoff)?;
-        let mut committed = {
-            let committed = self.inner.store.committed.read::<ChainFile>().await?;
-            if committed.finalized.is_some_and(|prior| *cutoff <= prior) {
-                return Ok(());
-            }
-            committed.clone()
-        };
+        let finalized = self.inner.store.frontier().await?;
+        if finalized.is_some_and(|prior| *cutoff <= prior) {
+            return Ok(());
+        }
 
-        let materialize = committed.block.mutations.range(..=*cutoff).next().is_some();
+        let transactions = self.inner.store.transactions_through(*cutoff).await?;
         operation.arm();
-        if materialize {
-            committed.materializing = Some(*cutoff);
-            storage::publish(&self.inner.store.committed, committed.clone()).await?;
-        }
         self.inner.subject.finalize(cutoff).await?;
-        if materialize {
-            self.inner.subject.sync_all().await?;
-        }
-        committed.finalized = Some(*cutoff);
-        committed.materializing = None;
-        committed.block.mutations.retain(|id, _| id > cutoff);
-        storage::publish(&self.inner.store.committed, committed).await?;
+        self.inner.store.publish_frontier(Some(*cutoff)).await?;
+
+        self.inner
+            .store
+            .clean_through(*cutoff, &transactions)
+            .await?;
 
         operation.finalize(*cutoff)?;
         operation.complete();
@@ -371,3 +381,7 @@ impl<Txn: StorageContext + std::fmt::Debug, FE> std::fmt::Debug for SyncChain<Tx
             .finish()
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/sync.rs"]
+mod tests;

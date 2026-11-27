@@ -7,8 +7,6 @@ name = "async-hash"
 version = "0.6.0"
 dependencies = [
  "futures",
- "hex",
- "num_cpus",
  "sha2",
 ]
 
@@ -94,6 +92,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -131,7 +135,7 @@ name = "collate"
 version = "0.4.2"
 dependencies = [
  "futures",
- "pin-project",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -139,15 +143,6 @@ name = "collection_literals"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2550f75b8cfac212855f6b1885455df8eaee8fe8e246b647d69146142e016084"
-
-[[package]]
-name = "convert_case"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
-dependencies = [
- "unicode-segmentation",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -210,16 +205,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a9b99b9cbbe49445b21764dc0625032a89b145a2642e67603e1c936f5458d05"
 dependencies = [
- "derive_more-impl 1.0.0",
-]
-
-[[package]]
-name = "derive_more"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
-dependencies = [
- "derive_more-impl 2.1.1",
+ "derive_more-impl",
 ]
 
 [[package]]
@@ -235,24 +221,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_more-impl"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
-dependencies = [
- "convert_case",
- "proc-macro2",
- "quote",
- "rustc_version",
- "syn 2.0.119",
- "unicode-xid",
-]
-
-[[package]]
 name = "destream"
 version = "0.10.1"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "smallvec",
@@ -264,8 +236,7 @@ dependencies = [
 name = "destream_json"
 version = "0.15.0"
 dependencies = [
- "async-recursion",
- "base64",
+ "base64 0.23.1",
  "bytes",
  "destream",
  "futures",
@@ -296,16 +267,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ds-ext"
-version = "0.4.0"
-dependencies = [
- "derive_more 2.1.1",
- "get-size",
- "get-size-derive",
- "safecast",
-]
-
-[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,6 +289,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fensor"
+version = "0.1.0"
+dependencies = [
+ "b-tree",
+ "collate",
+ "destream",
+ "freqfs",
+ "futures",
+ "get-size",
+ "ha-ndarray",
+ "num_cpus",
+ "number-general",
+ "safecast",
+ "smallvec",
+ "tokio",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,19 +320,15 @@ name = "frand"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0632aefca5b3940174bbea720a111b3ec3433a67852ab737299565c3ce2d32b4"
-dependencies = [
- "glam",
- "rand_core",
-]
 
 [[package]]
 name = "freqfs"
 version = "0.13.0"
 dependencies = [
  "async-recursion",
- "ds-ext",
  "fs2",
  "futures",
+ "get-size",
  "safecast",
  "tokio",
  "trait-variant",
@@ -497,17 +472,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "glam"
-version = "0.33.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e762b9b188634fc508d4ec54b62ea3d352c43fd431d18d05d46f559f217f4725"
-
-[[package]]
 name = "ha-ndarray"
 version = "0.5.0"
 dependencies = [
  "frand",
  "get-size",
+ "getrandom",
  "lazy_static",
  "num_cpus",
  "number-general",
@@ -534,7 +504,6 @@ name = "hr-id"
 version = "0.7.0"
 dependencies = [
  "async-hash",
- "derive_more 1.0.0",
  "destream",
  "get-size",
  "hex",
@@ -675,6 +644,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -801,6 +776,7 @@ dependencies = [
  "futures",
  "get-size",
  "get-size-derive",
+ "libm",
  "num",
  "safecast",
 ]
@@ -816,12 +792,13 @@ name = "pathlink"
 version = "0.5.0"
 dependencies = [
  "async-hash",
- "derive_more 1.0.0",
+ "derive_more",
  "destream",
  "get-size",
  "get-size-derive",
  "hex",
  "hr-id",
+ "percent-encoding",
  "safecast",
  "smallvec",
  "url",
@@ -951,12 +928,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-
-[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -974,15 +945,6 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
-]
-
-[[package]]
-name = "rustc_version"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
-dependencies = [
- "semver",
 ]
 
 [[package]]
@@ -1009,12 +971,6 @@ name = "safecast"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5ea1b305e0adf0de7fa9ee07ba2080790d241b8b22b1014116d8f03348d8792"
-
-[[package]]
-name = "semver"
-version = "1.0.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
@@ -1171,10 +1127,10 @@ dependencies = [
  "b-tree",
  "collate",
  "destream",
+ "fensor",
  "freqfs",
  "futures",
  "get-size",
- "ha-ndarray",
  "number-general",
  "pathlink",
  "safecast",
@@ -1191,6 +1147,10 @@ name = "tc-error"
 version = "0.13.1"
 dependencies = [
  "destream",
+ "fensor",
+ "freqfs",
+ "ha-ndarray",
+ "hr-id",
  "log",
  "pathlink",
  "serde",
@@ -1203,6 +1163,8 @@ version = "0.1.0"
 dependencies = [
  "async-hash",
  "destream",
+ "futures",
+ "get-size",
  "hr-id",
  "number-general",
  "pathlink",
@@ -1238,6 +1200,7 @@ dependencies = [
  "bytes",
  "collate",
  "destream",
+ "futures",
  "get-size",
  "hr-id",
  "number-general",
@@ -1329,8 +1292,8 @@ name = "txn_lock"
 version = "0.11.0"
 dependencies = [
  "collate",
- "ds-ext",
  "futures",
+ "get-size",
  "tokio",
 ]
 
@@ -1345,12 +1308,6 @@ name = "unicode-ident"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab72a15cf68d77cb0987d3684aa8a45c5ef827e8cb49ee2f30bfd7ba2feb519f"
-
-[[package]]
-name = "unicode-segmentation"
-version = "1.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-xid"

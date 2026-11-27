@@ -1,9 +1,7 @@
 # tc-chain invariants
 
 The repository-local [`CHAIN_CONTRACT.md`](CHAIN_CONTRACT.md) is the canonical
-behavioral contract. The parent
-[workspace invariants](https://github.com/TinyChain-Inc/tcv2/blob/main/AGENTS.md)
-are non-normative integration context when this repository is used as a submodule.
+behavioral contract.
 
 - Own durable ordered history, deterministic replay, canonical-state selection,
   divergence reconciliation, and coordinated resynchronization.
@@ -14,10 +12,11 @@ are non-normative integration context when this repository is used as a submodul
 - Preserve the recovery source defined by the variant: SyncChain's durable
   persistent subject plus retained request WAL, or a retained-history variant's
   complete history. Never reinterpret a replay conflict as success.
-- Fail closed on missing, corrupt, conflicting, or unverifiable history. Do not
+- Fail closed on missing referenced data or observed corrupt, conflicting, or unverifiable history. Do not
   skip records or add local repair heuristics.
-- Apply the workspace backpressure and deadline contracts to ingest, replay,
-  validation, and resynchronization.
+- Apply the local [failure and resource semantics](CHAIN_CONTRACT.md#failure-and-resource-semantics)
+  to ingest, replay, validation, and resynchronization. Callers supply deadlines
+  and bounded capacity; Chain does not choose host policy.
 - Implement SyncChain, BlockChain, and MetricsChain as policies over the one
   Chain boundary. Do not create variant-specific adapters, routing trees, or
   transaction lifecycles.
